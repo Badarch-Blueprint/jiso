@@ -1,0 +1,114 @@
+# FORK: build installable desktop artifacts on tag push and attach them to a
+# GitHub Release. Mirrors the canonical OSS build sequence (`gulp core-ci` →
+# `gulp vscode-<platform>-<arch>-min-ci`) that the Azure pipelines use, but runs
+# entirely on GitHub-hosted runners with no signing/notarization. Artifacts are
+# therefore UNSIGNED (macOS Gatekeeper / Windows SmartScreen will warn on first
+# run — right-click → Open on macOS, "More info → Run anyway" on Windows).
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Allow a manual run from the Actions tab without tagging.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag/name to publish under (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write # needed to create the GitHub Release and upload assets
+
+env:
+  # On a manual run there is no tag ref, so take it from the input.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # one platform failing shouldn't abort the others
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon runner → native arm64 build
+            platform: darwin
+            arch: arm64
+            out: VSCode-darwin-arm64
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x64
+            out: VSCode-linux-x64
+          - os: windows-2022
+            platform: win32
+            arch: x64
+            out: VSCode-win32-x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Setup Python # node-gyp needs Python for native module builds
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config xvfb libgtk-3-0 libxkbfile-dev libkrb5-dev libgbm1 rpm fakeroot
+
+      - name: Install build/ dependencies
+        working-directory: build
+        run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install root dependencies
+        run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          npm_config_arch: ${{ matrix.arch }}
+
+      - name: Compile (core-ci)
+        run: npm run gulp core-ci
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+
+      - name: Package (${{ matrix.platform }}-${{ matrix.arch }})
+        run: npm run gulp vscode-${{ matrix.platform }}-${{ matrix.arch }}-min-ci
+        env:
+          npm_config_arch: ${{ matrix.arch }}
+          NODE_OPTIONS: --max-old-space-size=8192
+
+      # The gulp package task writes to a sibling of the repo: ../<out>.
+      # Archive it so a single asset carries the whole app.
+      - name: Archive (macOS / Linux)
+        if: matrix.platform != 'win32'
+        run: |
+          cd ..
+          tar -czf "${{ github.workspace }}/${{ matrix.out }}.tar.gz" "${{ matrix.out }}"
+
+      - name: Archive (Windows)
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "..\${{ matrix.out }}" -DestinationPath "${{ github.workspace }}\${{ matrix.out }}.zip"
+
+      - name: Publish to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create the release once; concurrent matrix jobs race, so ignore "already exists".
+          # (No --verify-tag: a manual run can create the tag at the checked-out commit.)
+          gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes 2>/dev/null || true
+          asset=$( [ "${{ matrix.platform }}" = "win32" ] && echo "${{ matrix.out }}.zip" || echo "${{ matrix.out }}.tar.gz" )
+          gh release upload "$RELEASE_TAG" "$asset" --clobber

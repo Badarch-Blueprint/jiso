@@ -1,0 +1,42 @@
+---
+description: 
+alwaysApply: true
+---
+
+# Attachment & context discipline
+
+When the user attaches a file larger than ~500 lines (or pastes a wall of code), follow these rules.
+
+## Never re-read what is already in context
+
+If the user already attached the file, do NOT call `Read` on the same file again. The bytes are already in your context. Use them directly. Calling `Read` on an attached file roughly doubles its token cost for no benefit.
+
+## Read narrowly when you must read
+
+When the user names a function, class, symbol, or line range inside a large file that is NOT already attached:
+
+1. Use `Grep` (with the function/symbol as the pattern) to find the line numbers.
+2. Use `Read` with `offset` and `limit` to load only ~30–80 lines around the match.
+3. Do NOT read the entire file just to find one function.
+
+For files known to be >1000 lines (e.g. `contract.service.ts`), this is mandatory, not optional.
+
+## Quote code by reference, not by repetition
+
+In your responses, NEVER paste back the entire attached file or large unchanged blocks of it. To point at existing code, use the code reference form `startLine:endLine:filepath` so the user sees a compact citation instead of a re-quote. Only show full code when proposing NEW or CHANGED code.
+
+## Be surgical in edits
+
+When fixing a bug in one function of a large service:
+
+- Use `StrReplace` with the smallest unique snippet that disambiguates the location.
+- Do NOT rewrite the entire file when only a function changed.
+- Do NOT include adjacent untouched functions in the diff.
+
+## Educate, but only once per session
+
+If the user repeatedly attaches huge files for small surgical fixes, mention ONCE (not every turn) that they can narrow attachments with `@file#functionName` or `@file:startLine-endLine` in Cursor's prompt. After mentioning it once, stop bringing it up.
+
+## Why this rule exists
+
+Attaching a 1500-line service to ask about one function costs ~17K tokens per turn. Reading 50 lines around the function costs ~600 tokens. Same answer, ~30× cheaper. The rule exists to make the cheap path automatic and the expensive path deliberate.

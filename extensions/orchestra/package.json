@@ -1,0 +1,40 @@
+{
+	"name": "orchestra",
+	"displayName": "Orchestra",
+	"description": "Drive headless coding agents (Claude Code, cursor-agent, Antigravity) from the chat panel",
+	"version": "0.0.1",
+	"publisher": "orchestra",
+	"license": "MIT",
+	"engines": {
+		"vscode": "0.10.x"
+	},
+	"categories": [
+		"AI",
+		"Chat"
+	],
+	"activationEvents": [
+		"onChatParticipant:orchestra.agent"
+	],
+	"main": "./out/extension.js",
+	"capabilities": {
+		"untrustedWorkspaces": {
+			"supported": true
+		},
+		"virtualWorkspaces": false
+	},
+	"contributes": {
+		"chatParticipants": [
+			{
+				"id": "orchestra.agent",
+				"name": "orchestra",
+				"fullName": "Orchestra",
+				"description": "Ask the orchestra (Claude Code headless)",
+				"isSticky": true
+			}
+		]
+	},
+	"scripts": {
+		"compile": "gulp compile-extension:orchestra",
+		"watch": "gulp watch-extension:orchestra"
+	}
+}
