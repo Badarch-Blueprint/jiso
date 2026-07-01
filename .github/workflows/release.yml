@@ -55,7 +55,7 @@ jobs:
           node-version-file: .nvmrc
 
       - name: Setup Python # node-gyp needs Python for native module builds
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
