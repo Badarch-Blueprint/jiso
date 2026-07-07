@@ -55,6 +55,7 @@ import { IAccessibilityService } from '../../../../../../platform/accessibility/
 import { MenuWorkbenchButtonBar } from '../../../../../../platform/actions/browser/buttonbar.js';
 import { HiddenItemStrategy, MenuWorkbenchToolBar } from '../../../../../../platform/actions/browser/toolbar.js';
 import { MenuId, MenuItemAction } from '../../../../../../platform/actions/common/actions.js';
+import { ICommandService } from '../../../../../../platform/commands/common/commands.js';
 import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { ContextKeyExpr, IContextKey, IContextKeyService, RawContextKey } from '../../../../../../platform/contextkey/common/contextkey.js';
 import { IFileService } from '../../../../../../platform/files/common/files.js';
@@ -84,8 +85,8 @@ import { ChatContextKeys } from '../../../common/actions/chatContextKeys.js';
 import { ChatRequestVariableSet, getImageAttachmentLimit, IChatRequestVariableEntry, isBrowserViewVariableEntry, isElementVariableEntry, isExplicitFileOrImageVariableEntry, isImageVariableEntry, isNotebookOutputVariableEntry, isPasteVariableEntry, isPromptFileVariableEntry, isPromptTextVariableEntry, isSCMHistoryItemChangeRangeVariableEntry, isSCMHistoryItemChangeVariableEntry, isSCMHistoryItemVariableEntry, isStringVariableEntry, OmittedState } from '../../../common/attachments/chatVariableEntries.js';
 import { ChatMode, getModeNameForTelemetry, IChatMode, IChatModes, IChatModeService } from '../../../common/chatModes.js';
 import { IChatFollowup, IChatPlanReview, IChatQuestionCarousel, IChatToolInvocation } from '../../../common/chatService/chatService.js';
-import { IChatSessionProviderOptionGroup, IChatSessionProviderOptionItem, IChatSessionsService, isAgentHostTarget, isIChatSessionFileChange2, localChatSessionType, SessionType } from '../../../common/chatSessionsService.js';
-import { ChatAgentLocation, ChatConfiguration, ChatModeKind, ChatPermissionLevel, isChatPermissionLevel } from '../../../common/constants.js';
+import { IChatSessionProviderOptionGroup, IChatSessionProviderOptionItem, IChatSessionsService, isAgentHostTarget, isIChatSessionFileChange2, isLocalAgentHostTarget, localChatSessionType, SessionType } from '../../../common/chatSessionsService.js';
+import { ChatAgentLocation, ChatConfiguration, ChatModeKind, ChatPermissionLevel, isChatPermissionLevel, OPEN_AGENT_SESSION_WITH_MODEL_COMMAND_ID } from '../../../common/constants.js';
 import { IChatEditingSession, IModifiedFileEntry, ModifiedFileEntryState } from '../../../common/editing/chatEditingService.js';
 import { ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier, ILanguageModelsService } from '../../../common/languageModels.js';
 import { ChatModelConfigurationStore } from './chatModelConfigurationStore.js';
@@ -141,7 +142,7 @@ import { ChatInputNotificationWidget } from './chatInputNotificationWidget.js';
 import { IChatInputPickerOptions } from './chatInputPickerActionItem.js';
 import { ChatSelectedTools } from './chatSelectedTools.js';
 import { DelegationSessionPickerActionItem } from './delegationSessionPickerActionItem.js';
-import { ModelPickerActionItem, IModelPickerDelegate } from './modelPickerActionItem.js';
+import { ModelPickerActionItem, ICrossAgentModelGroup, IModelPickerDelegate } from './modelPickerActionItem.js';
 import { IModePickerDelegate, ModePickerActionItem } from './modePickerActionItem.js';
 import { IPermissionPickerDelegate, PermissionPickerActionItem } from './permissionPickerActionItem.js';
 import { SessionTypePickerActionItem } from './sessionTargetPickerActionItem.js';
@@ -602,6 +603,13 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 	private _pendingDelegationTarget: AgentSessionTarget | undefined = undefined;
 	private _currentSessionType: string | undefined = undefined;
 
+	/**
+	 * The storage key `initSelectedModel` last read its persisted selection from.
+	 * Used to detect when a session-type change moved the widget to a different
+	 * storage bucket, so the persisted selection must be re-read.
+	 */
+	private _selectedModelInitStorageKey: string | undefined = undefined;
+
 	constructor(
 		// private readonly editorOptions: ChatEditorOptions, // TODO this should be used
 		private readonly location: ChatAgentLocation,
@@ -641,6 +649,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		@IDialogService private readonly dialogService: IDialogService,
 		@IFileDialogService private readonly fileDialogService: IFileDialogService,
 		@IClipboardService private readonly clipboardService: IClipboardService,
+		@ICommandService private readonly commandService: ICommandService,
 	) {
 		super();
 
@@ -910,16 +919,14 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		this.filePartOfEditSessionKey.set(isFilePartOfEditSession);
 	}
 
-	private getSelectedModelStorageKey(): string {
-		const sessionType = this._currentSessionType;
+	private getSelectedModelStorageKey(sessionType: string | undefined = this._currentSessionType): string {
 		if (sessionType && this.sessionTypeHasOwnModelPool(sessionType)) {
 			return `chat.currentLanguageModel.${this.location}.${sessionType}`;
 		}
 		return `chat.currentLanguageModel.${this.location}`;
 	}
 
-	private getSelectedModelIsDefaultStorageKey(): string {
-		const sessionType = this._currentSessionType;
+	private getSelectedModelIsDefaultStorageKey(sessionType: string | undefined = this._currentSessionType): string {
 		if (sessionType && this.sessionTypeHasOwnModelPool(sessionType)) {
 			return `chat.currentLanguageModel.${this.location}.${sessionType}.isDefault`;
 		}
@@ -944,6 +951,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		this._modelConfigStore.clear();
 
 		const selectedModelStorageKey = this.getSelectedModelStorageKey();
+		this._selectedModelInitStorageKey = selectedModelStorageKey;
 		const selectedModelIsDefaultStorageKey = this.getSelectedModelIsDefaultStorageKey();
 		const persistedSelection = this.storageService.get(selectedModelStorageKey, StorageScope.APPLICATION);
 		const persistedAsDefault = this.storageService.getBoolean(selectedModelIsDefaultStorageKey, StorageScope.APPLICATION, true);
@@ -1136,7 +1144,54 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 				return sessionResource ? chatSessionResourceToId(sessionResource) : undefined;
 			},
 			modelConfiguration: this._modelConfigStore,
+			getCrossAgentModelGroups: () => this.getCrossAgentModelGroups(),
+			selectCrossAgentModel: model => this.selectCrossAgentModel(model),
 		};
+	}
+
+	/**
+	 * FORK: models owned by OTHER local agent-host session types (e.g. Cursor
+	 * Agent / Antigravity while chatting with Claude), grouped per agent for the
+	 * model picker's cross-agent sections. Only offered while the current
+	 * session is a default/local or agent-host session — remote or otherwise
+	 * specialized session types keep their picker scoped to their own pool.
+	 */
+	private getCrossAgentModelGroups(): ICrossAgentModelGroup[] {
+		const currentType = this.getCurrentSessionType();
+		if (currentType && currentType !== localChatSessionType && !isAgentHostTarget(currentType)) {
+			return [];
+		}
+		const groups: ICrossAgentModelGroup[] = [];
+		const allModels = this.getAllMergedModels();
+		for (const contribution of this.chatSessionsService.getAllChatSessionContributions()) {
+			if (!isLocalAgentHostTarget(contribution.type) || contribution.type === currentType) {
+				continue;
+			}
+			const models = allModels.filter(m => m.metadata.targetChatSessionType === contribution.type && m.metadata.isUserSelectable !== false);
+			if (models.length) {
+				groups.push({ sessionType: contribution.type, displayName: contribution.displayName, models });
+			}
+		}
+		return groups;
+	}
+
+	/**
+	 * FORK: the user picked a model that belongs to another local agent. A
+	 * session is bound to one backend agent, so the model cannot be applied in
+	 * place — instead persist it as the owning session type's selected model
+	 * and open a new session of that agent where the picker restores it.
+	 * Sidebar chats switch in place; editor-hosted chats open a new editor.
+	 */
+	private selectCrossAgentModel(model: ILanguageModelChatMetadataAndIdentifier): void {
+		const sessionType = model.metadata.targetChatSessionType;
+		if (!sessionType) {
+			return;
+		}
+		this.storageService.store(this.getSelectedModelStorageKey(sessionType), model.identifier, StorageScope.APPLICATION, StorageTarget.USER);
+		this.storageService.store(this.getSelectedModelIsDefaultStorageKey(sessionType), false, StorageScope.APPLICATION, StorageTarget.USER);
+		const displayName = this.chatSessionsService.getChatSessionContribution(sessionType)?.displayName ?? sessionType;
+		const position = this._widget && isIChatViewViewContext(this._widget.viewContext) ? 'sidebar' : 'editor';
+		this.commandService.executeCommand(OPEN_AGENT_SESSION_WITH_MODEL_COMMAND_ID, { type: sessionType, displayName, position });
 	}
 
 	/**
@@ -2979,6 +3034,15 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			} else if (e.currentSessionResource) {
 				logChangesToStateModel(this._inputModel, `[CVVM].2 onDidChangeViewModel -> session change: ${this._currentSessionType} -> ${newSessionType} in ${this._currentSessionKey}, ${e.currentSessionResource.toString()}`, undefined, this._inputModel?.state.get(), this.logService);
 				this._currentSessionType = newSessionType;
+				// The constructor ran `initSelectedModel` before any session was bound, so it
+				// read the unsuffixed storage key. If the first bind is to a session type with
+				// its own model pool (suffixed key), re-read the persisted selection from the
+				// right bucket — otherwise the user's pick is never restored, and the next
+				// model-list change clobbers it in storage with the default.
+				if (this.getSelectedModelStorageKey() !== this._selectedModelInitStorageKey) {
+					logChangesToStateModel(this._inputModel, `[CVVM].2 storage key changed ${this._selectedModelInitStorageKey} -> ${this.getSelectedModelStorageKey()}, re-running initSelectedModel`, undefined, this._inputModel?.state.get(), this.logService);
+					this.initSelectedModel();
+				}
 			}
 
 			// For contributed sessions with history, pre-select the model

@@ -11,8 +11,11 @@ import { COPILOT_OTEL_CAPTURE_CONTENT_KEY, COPILOT_OTEL_ENABLED_KEY, COPILOT_OTE
 import product from '../../product/common/product.js';
 import { Registry } from '../../registry/common/platform.js';
 import {
+	AgentHostAntigravityAgentEnabledSettingId,
 	AgentHostClaudeAgentEnabledSettingId,
+	AgentHostCodexFuguAgentEnabledSettingId,
 	AgentHostCodexAgentBinaryArgsSettingId,
+	AgentHostCursorAgentEnabledSettingId,
 	AgentHostCodexAgentEnabledSettingId,
 	AgentHostCodexAgentSdkRootSettingId,
 	AgentHostCodexAgentCodexHomeSettingId,
@@ -128,6 +131,31 @@ configurationRegistry.registerConfiguration({
 					}
 				}
 			},
+		},
+		// FORK: opt-in providers driven by locally installed third-party agent CLIs.
+		// Both default off; they only register when enabled AND the CLI is on PATH.
+		[AgentHostCursorAgentEnabledSettingId]: {
+			type: 'boolean',
+			description: nls.localize('chat.agentHost.cursorAgent.enabled', "When enabled, the agent host registers the Cursor Agent provider, driven by the locally installed `cursor-agent` CLI in headless mode (using your own Cursor login). Requires `#chat.agentHost.enabled#` and the `cursor-agent` CLI on PATH. The agent host process must be restarted for changes to take effect."),
+			default: false,
+			tags: ['experimental', 'advanced'],
+		},
+		// FORK: Antigravity provider disabled 2026-07 (see agentHostMain.ts) — Google has
+		// permanently banned accounts for driving Antigravity via third-party tools. The
+		// setting is hidden and the provider registration is commented out; the setting
+		// currently has no effect even if set in JSON.
+		[AgentHostAntigravityAgentEnabledSettingId]: {
+			type: 'boolean',
+			description: nls.localize('chat.agentHost.antigravityAgent.enabled', "When enabled, the agent host registers the Antigravity provider, driven by the locally installed `agy` CLI in headless mode (using your own Google sign-in, Gemini models). Requires `#chat.agentHost.enabled#` and the `agy` CLI on PATH. The agent host process must be restarted for changes to take effect."),
+			default: false,
+			tags: ['experimental', 'advanced'],
+			included: false,
+		},
+		[AgentHostCodexFuguAgentEnabledSettingId]: {
+			type: 'boolean',
+			description: nls.localize('chat.agentHost.codexFuguAgent.enabled', "When enabled, the agent host registers the Codex Fugu provider, driven by the locally installed `codex-fugu` CLI in headless mode (using your own login, Fugu/GPT models). Requires `#chat.agentHost.enabled#` and the `codex-fugu` CLI on PATH. The agent host process must be restarted for changes to take effect."),
+			default: false,
+			tags: ['experimental', 'advanced'],
 		},
 		[AgentHostCodexAgentSdkRootSettingId]: {
 			type: 'string',

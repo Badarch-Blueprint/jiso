@@ -1388,6 +1388,41 @@ export class ModelPickerWidget extends Disposable {
 			this._isLoadingModels(),
 		);
 
+		// FORK: sections for models owned by other local agents (e.g. Cursor
+		// Agent / Antigravity while chatting with Claude). A session is bound to
+		// one backend agent, so these are not selectable in place — picking one
+		// hands the conversation over to a new session of the owning agent with
+		// that model preselected. Suppressed in the Restricted / setup-required
+		// states, which replace the whole list with a single explanatory action.
+		if (!this.isRestrictedMode() && !this.isSetupRequired() && this._delegate.getCrossAgentModelGroups && this._delegate.selectCrossAgentModel) {
+			const selectCrossAgentModel = this._delegate.selectCrossAgentModel;
+			for (const group of this._delegate.getCrossAgentModelGroups()) {
+				items.push({
+					kind: ActionListItemKind.Header,
+					label: group.displayName,
+				});
+				for (const model of group.models) {
+					const label = model.metadata.name;
+					const tooltip = localize('chat.modelPicker.crossAgent.tooltip', "Start a new {0} session with {1}", group.displayName, label);
+					items.push({
+						item: {
+							id: `crossAgent.${group.sessionType}.${model.identifier}`,
+							enabled: true,
+							checked: false,
+							class: undefined,
+							tooltip,
+							label,
+							run: () => selectCrossAgentModel(model),
+						},
+						kind: ActionListItemKind.Action,
+						label,
+						group: { title: '', icon: ThemeIcon.fromId(Codicon.blank.id) },
+						hideIcon: false,
+					});
+				}
+			}
+		}
+
 		// Collect all hover disposables so they are properly cleaned up when the
 		// picker is hidden. The ActionListWidget only tracks the disposable for the
 		// currently-shown hover; all other items' hover disposables would leak.

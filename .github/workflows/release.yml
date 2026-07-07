@@ -156,6 +156,31 @@ jobs:
         shell: pwsh
         run: ./.github/workflows/node_modules_cache/cache.ps1 archive
 
+      # Point built apps at the npm registry for the Claude Agent SDK. The SDK
+      # is proprietary (all-rights-reserved), so it must NOT be bundled into or
+      # hosted alongside our artifacts — each install downloads it at first use
+      # from npm (Anthropic's own distribution channel) via the agent-host's
+      # AgentSdkDownloader. Dev builds keep resolving the repo devDependency;
+      # this stamp only affects the product.json shipped inside release builds.
+      - name: Stamp agent SDK download config
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const version = JSON.parse(fs.readFileSync("package.json", "utf8")).devDependencies["@anthropic-ai/claude-agent-sdk"];
+            if (!/^\d+\.\d+\.\d+$/.test(version)) { throw new Error(`claude-agent-sdk version must be an exact pin, got: ${version}`); }
+            const product = JSON.parse(fs.readFileSync("product.json", "utf8"));
+            product.agentSdks = {
+              ...product.agentSdks,
+              claude: {
+                version,
+                npmPackages: ["@anthropic-ai/claude-agent-sdk", "@anthropic-ai/claude-agent-sdk-{sdkTarget}"],
+              },
+            };
+            fs.writeFileSync("product.json", JSON.stringify(product, null, "\t") + "\n");
+            console.log("Stamped product.agentSdks.claude @", version);
+          '
+
       - name: Compile (core-ci)
         run: npm run gulp core-ci
         env:
@@ -267,6 +292,6 @@ jobs:
         run: |
           # Create the release once; concurrent matrix jobs race, so ignore "already exists".
           # (No --verify-tag: a manual run can create the tag at the checked-out commit.)
-          gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes 2>/dev/null || true
+          gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes --prerelease 2>/dev/null || true
           asset=$( [ "${{ matrix.platform }}" = "win32" ] && echo "${{ matrix.out }}.zip" || echo "${{ matrix.out }}.tar.gz" )
           gh release upload "$RELEASE_TAG" "$asset" --clobber

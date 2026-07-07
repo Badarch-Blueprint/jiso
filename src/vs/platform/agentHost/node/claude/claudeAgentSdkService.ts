@@ -30,10 +30,12 @@ export const ClaudeSdkPackage: IAgentSdkPackage = {
 
 /**
  * FORK: whether `@anthropic-ai/claude-agent-sdk` resolves from the app's own
- * `node_modules` (it is a production dependency, so packaged builds ship it).
- * Lets the agent-host entry points register the Claude provider in built
- * installs without a `product.agentSdks.claude` download config — the
- * bare-import path in `ClaudeAgentSdkService._loadSdk` loads the bundled copy.
+ * `node_modules`. True in dev (it is a devDependency of this repo) and false
+ * in shipped builds — the SDK is deliberately NOT bundled into artifacts
+ * (its license is all-rights-reserved, so redistribution is not ours to do);
+ * built installs get it via the `product.agentSdks.claude` npm download
+ * config instead. Kept as a registration fallback so a build that somehow
+ * ships the module still registers the provider.
  */
 export function isClaudeSdkModuleBundled(): boolean {
 	try {

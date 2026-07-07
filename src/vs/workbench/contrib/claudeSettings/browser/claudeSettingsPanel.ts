@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 /*---------------------------------------------------------------------------------------------
- *  FORK: "Claude Settings" webview editor — a GUI for JisoIDE's own agent-host
+ *  FORK: "Jiso Settings" webview editor — a GUI for JisoIDE's own agent-host
  *  configuration (NOT the Claude CLI's `/config`).
  *
  *  Renders the context-management knobs from the agent-host root config schema
@@ -23,10 +23,11 @@ import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.j
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { localize } from '../../../../nls.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
+import { ConfigurationTarget, IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { AgentHostConfigKey, agentHostCustomizationConfigSchema } from '../../../../platform/agentHost/common/agentHostCustomizationConfig.js';
-import { IAgentHostService } from '../../../../platform/agentHost/common/agentService.js';
+import { AgentHostAntigravityAgentEnabledSettingId, AgentHostCodexFuguAgentEnabledSettingId, AgentHostCursorAgentEnabledSettingId, IAgentHostService } from '../../../../platform/agentHost/common/agentService.js';
 import { ActionType } from '../../../../platform/agentHost/common/state/sessionActions.js';
 import { ROOT_STATE_URI } from '../../../../platform/agentHost/common/state/sessionState.js';
 import { WebviewInput } from '../../webviewPanel/browser/webviewEditorInput.js';
@@ -40,7 +41,7 @@ export const IClaudeSettingsService = createDecorator<IClaudeSettingsService>('c
 
 export interface IClaudeSettingsService {
 	readonly _serviceBrand: undefined;
-	/** Reveal (or open) the Claude Settings editor tab. */
+	/** Reveal (or open) the Jiso Settings editor tab. */
 	show(): Promise<void>;
 }
 
@@ -52,6 +53,14 @@ interface ISettingsField {
 	readonly description: string | undefined;
 	readonly type: 'boolean' | 'number';
 	readonly defaultValue: unknown;
+}
+
+interface IAgentCliField {
+	readonly provider: string;
+	readonly settingKey: string;
+	readonly group: string;
+	readonly label: string;
+	readonly description: string;
 }
 
 /**
@@ -67,6 +76,32 @@ const CONTEXT_MANAGEMENT_KEYS: readonly AgentHostConfigKey[] = [
 	AgentHostConfigKey.ClaudeLocalContextTrim,
 	AgentHostConfigKey.ClaudeLocalContextTrimMaxChars,
 	AgentHostConfigKey.ClaudeLocalContextDedupeReads,
+];
+
+const AGENT_CLI_GROUP = localize('jisoSettings.group.agentsAndClis', "Agents and CLIs");
+
+const AGENT_CLI_FIELDS: readonly IAgentCliField[] = [
+	{
+		provider: 'antigravity',
+		settingKey: AgentHostAntigravityAgentEnabledSettingId,
+		group: AGENT_CLI_GROUP,
+		label: localize('jisoSettings.agent.antigravity', "Antigravity (agy)"),
+		description: localize('jisoSettings.agent.antigravity.description', "Enable the local agy headless CLI and load models from agy models."),
+	},
+	{
+		provider: 'cursor-agent',
+		settingKey: AgentHostCursorAgentEnabledSettingId,
+		group: AGENT_CLI_GROUP,
+		label: localize('jisoSettings.agent.cursorAgent', "Cursor Agent"),
+		description: localize('jisoSettings.agent.cursorAgent.description', "Enable the local cursor-agent headless CLI. Only the Auto model is surfaced."),
+	},
+	{
+		provider: 'codex-fugu',
+		settingKey: AgentHostCodexFuguAgentEnabledSettingId,
+		group: AGENT_CLI_GROUP,
+		label: localize('jisoSettings.agent.codexFugu', "Codex Fugu"),
+		description: localize('jisoSettings.agent.codexFugu.description', "Enable the local codex-fugu headless CLI (Fugu, Fugu Ultra, GPT-5.5 and Codex 5.3 models)."),
+	},
 ];
 
 /**
@@ -102,12 +137,18 @@ export class ClaudeSettingsPanel extends Disposable implements IClaudeSettingsSe
 		@IAgentHostService private readonly _agentHostService: IAgentHostService,
 		@INotificationService private readonly _notificationService: INotificationService,
 		@ICommandService private readonly _commandService: ICommandService,
+		@IConfigurationService private readonly _configurationService: IConfigurationService,
 	) {
 		super();
+		this._register(this._configurationService.onDidChangeConfiguration(e => {
+			if (AGENT_CLI_FIELDS.some(field => e.affectsConfiguration(field.settingKey))) {
+				this._postState();
+			}
+		}));
 	}
 
 	async show(): Promise<void> {
-		const title = localize('claudeSettings.title', "Claude Settings");
+		const title = localize('claudeSettings.title', "Jiso Settings");
 		const activePane = this._editorService.activeEditorPane;
 
 		if (this._current) {
@@ -141,7 +182,7 @@ export class ClaudeSettingsPanel extends Disposable implements IClaudeSettingsSe
 		this._current.webview.setHtml(this._html());
 	}
 
-	private _onMessage(message: { type?: string; values?: Record<string, unknown> }): void {
+	private _onMessage(message: { type?: string; values?: Record<string, unknown>; provider?: string; enabled?: boolean }): void {
 		try {
 			switch (message?.type) {
 				case 'ready':
@@ -158,10 +199,13 @@ export class ClaudeSettingsPanel extends Disposable implements IClaudeSettingsSe
 					// the vanilla settings UI is reachable from here instead.
 					void this._commandService.executeCommand('workbench.action.openSettings');
 					return;
+				case 'toggleAgent':
+					void this._toggleAgent(message.provider, !!message.enabled);
+					return;
 			}
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			this._notificationService.error(localize('claudeSettings.saveError', "Claude Settings: {0}", msg));
+			this._notificationService.error(localize('claudeSettings.saveError', "Jiso Settings: {0}", msg));
 			this._post({ type: 'error', message: msg });
 		}
 	}
@@ -185,17 +229,114 @@ export class ClaudeSettingsPanel extends Disposable implements IClaudeSettingsSe
 		this._agentHostService.dispatch(ROOT_STATE_URI, { type: ActionType.RootConfigChanged, config: patch });
 	}
 
+	private async _toggleAgent(provider: string | undefined, enabled: boolean): Promise<void> {
+		const field = AGENT_CLI_FIELDS.find(candidate => candidate.provider === provider);
+		if (!field) {
+			return;
+		}
+		this._post({ type: 'agentLoading', provider: field.provider, loading: true });
+		try {
+			// The setting change is forwarded to the agent host as root config
+			// (see `_updateCliAgentsEnabled` in the host services), which
+			// registers/unregisters the provider live — no restart involved.
+			await this._configurationService.updateValue(field.settingKey, enabled, ConfigurationTarget.USER);
+			const available = await this._waitForAgentState(field.provider, enabled, 30_000);
+			if (!available) {
+				throw new Error(enabled
+					? localize('jisoSettings.agentEnableTimeout', "{0} did not become available. Check that the CLI is installed and authenticated.", field.label)
+					: localize('jisoSettings.agentDisableTimeout', "{0} did not shut down in time.", field.label));
+			}
+			if (enabled) {
+				const pinged = await this._pingAgentWithRetry(field.provider, 45_000);
+				if (!pinged) {
+					await this._configurationService.updateValue(field.settingKey, false, ConfigurationTarget.USER);
+					throw new Error(localize('jisoSettings.agentPingFailed', "{0} did not respond to the validation ping.", field.label));
+				}
+				await this._waitForAgentState(field.provider, true, 15_000, true);
+			}
+			this._post({ type: 'saved' });
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			this._notificationService.error(localize('claudeSettings.saveError', "Jiso Settings: {0}", msg));
+			this._post({ type: 'error', message: msg });
+		} finally {
+			this._post({ type: 'agentLoading', provider: field.provider, loading: false });
+			this._postState();
+		}
+	}
+
+	private async _pingAgentWithRetry(provider: string, timeoutMs: number): Promise<boolean> {
+		const startedAt = Date.now();
+		while (Date.now() - startedAt < timeoutMs) {
+			try {
+				if (await this._agentHostService.pingAgent(provider)) {
+					return true;
+				}
+			} catch {
+				// Retry until timeout; auth/model refresh can race provider registration.
+			}
+			await new Promise(resolve => setTimeout(resolve, 2_000));
+		}
+		return false;
+	}
+
+	private _waitForAgentState(provider: string, enabled: boolean, timeoutMs: number, requireModels = false): Promise<boolean> {
+		const matches = (): boolean => {
+			const rootState = this._agentHostService.rootState.value;
+			if (!rootState || rootState instanceof Error) {
+				return false;
+			}
+			const agent = rootState.agents.find(candidate => candidate.provider === provider);
+			return enabled ? !!agent && (!requireModels || agent.models.length > 0) : !agent;
+		};
+		if (matches()) {
+			return Promise.resolve(true);
+		}
+		return new Promise(resolve => {
+			const store = new DisposableStore();
+			const timeout = setTimeout(() => {
+				store.dispose();
+				resolve(matches());
+			}, timeoutMs);
+			const finish = (value: boolean) => {
+				clearTimeout(timeout);
+				store.dispose();
+				resolve(value);
+			};
+			store.add(this._agentHostService.rootState.onDidChange(() => {
+				if (matches()) {
+					finish(true);
+				}
+			}));
+			store.add(this._agentHostService.onAgentHostExit(() => {
+				if (!enabled) {
+					finish(true);
+				}
+			}));
+		});
+	}
+
 	private _postState(): void {
 		const rootState = this._agentHostService.rootState.value;
-		const available = !!rootState && !(rootState instanceof Error);
-		const allValues = available ? rootState.config?.values ?? {} : {};
+		const availableRootState = rootState && !(rootState instanceof Error) ? rootState : undefined;
+		const available = !!availableRootState;
+		const allValues = availableRootState?.config?.values ?? {};
 		const values: Record<string, unknown> = {};
 		for (const field of this._fields) {
 			if (Object.prototype.hasOwnProperty.call(allValues, field.key)) {
 				values[field.key] = allValues[field.key];
 			}
 		}
-		this._post({ type: 'state', available, values });
+		const agents = AGENT_CLI_FIELDS.map(field => {
+			const agent = availableRootState?.agents.find(candidate => candidate.provider === field.provider);
+			return {
+				provider: field.provider,
+				enabled: this._configurationService.getValue<boolean>(field.settingKey),
+				active: !!agent,
+				models: agent?.models.map(model => model.name) ?? [],
+			};
+		});
+		this._post({ type: 'state', available, values, agents });
 	}
 
 	private _post(payload: unknown): void {
@@ -205,14 +346,19 @@ export class ClaudeSettingsPanel extends Disposable implements IClaudeSettingsSe
 	private _html(): string {
 		const nonce = generateUuid();
 		const nls = {
-			title: localize('claudeSettings.title', "Claude Settings"),
+			title: localize('claudeSettings.title', "Jiso Settings"),
 			search: localize('claudeSettings.search', "Search settings"),
 			openVsCodeSettings: localize('claudeSettings.openVsCodeSettings', "Open VS Code Settings"),
 			savedMsg: localize('claudeSettings.saved', "Saved"),
 			unavailable: localize('claudeSettings.hostUnavailable', "The agent host is not connected yet — settings will load once it is."),
+			loading: localize('jisoSettings.agent.loading', "Checking..."),
+			on: localize('jisoSettings.agent.on', "On"),
+			off: localize('jisoSettings.agent.off', "Off"),
+			models: localize('jisoSettings.agent.models', "{0} models"),
 		};
 		return HTML_TEMPLATE
 			.replace('/*__FIELDS__*/', JSON.stringify(this._fields))
+			.replace('/*__AGENTS__*/', JSON.stringify(AGENT_CLI_FIELDS))
 			.replace('/*__NLS__*/', JSON.stringify(nls))
 			.replace(/__NONCE__/g, nonce);
 	}
@@ -259,7 +405,12 @@ const HTML_TEMPLATE = /* html */ `<!DOCTYPE html>
 	.row-text { flex: 1; min-width: 0; }
 	.row-title { font-size: 13px; }
 	.row-desc { font-size: 12px; opacity: .58; margin-top: 3px; }
-	.row-control { flex: 0 0 auto; display: flex; align-items: center; }
+	.row-status { font-size: 11px; opacity: .62; margin-top: 5px; }
+	.row-control { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
+	.spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--vscode-button-background); border-radius: 50%; animation: spin .8s linear infinite; display: none; }
+	.row.loading .spinner { display: block; }
+	.row.loading .switch { pointer-events: none; opacity: .6; }
+	@keyframes spin { to { transform: rotate(360deg); } }
 
 	input[type=text] {
 		background: var(--vscode-settings-dropdownBackground, var(--vscode-input-background)); color: var(--vscode-input-foreground);
@@ -306,10 +457,12 @@ const HTML_TEMPLATE = /* html */ `<!DOCTYPE html>
 <script nonce="__NONCE__">
 	const vscode = acquireVsCodeApi();
 	const FIELDS = /*__FIELDS__*/;
+	const AGENTS = /*__AGENTS__*/;
 	const NLS = /*__NLS__*/;
 	const $ = id => document.getElementById(id);
-	const groups = [...new Set(FIELDS.map(f => f.group))];
+	const groups = [...new Set([...AGENTS.map(f => f.group), ...FIELDS.map(f => f.group)])];
 	let saveTimer = null;
+	const loadingAgents = new Set();
 
 	$('brand').textContent = NLS.title;
 	$('search').placeholder = NLS.search;
@@ -350,12 +503,44 @@ const HTML_TEMPLATE = /* html */ `<!DOCTYPE html>
 		return inp;
 	}
 
+	function agentControl(agent) {
+		const wrap = document.createElement('div');
+		wrap.className = 'row-control';
+		const spinner = document.createElement('span');
+		spinner.className = 'spinner';
+		const label = document.createElement('label');
+		label.className = 'switch';
+		const cb = document.createElement('input');
+		cb.type = 'checkbox';
+		cb.id = 'agent_' + agent.provider;
+		cb.addEventListener('change', () => {
+			setAgentLoading(agent.provider, true);
+			vscode.postMessage({ type: 'toggleAgent', provider: agent.provider, enabled: cb.checked });
+		});
+		const sl = document.createElement('span');
+		sl.className = 'slider';
+		label.appendChild(cb);
+		label.appendChild(sl);
+		wrap.appendChild(spinner);
+		wrap.appendChild(label);
+		return wrap;
+	}
+
 	function buildForm() {
 		const form = $('form');
 		form.innerHTML = '';
 		for (const g of groups) {
 			const sec = document.createElement('div'); sec.className = 'group'; sec.id = slug(g);
 			const h = document.createElement('h2'); h.textContent = g; sec.appendChild(h);
+			for (const agent of AGENTS.filter(x => x.group === g)) {
+				const row = document.createElement('div'); row.className = 'row agent-row'; row.dataset.provider = agent.provider; row.dataset.key = (agent.label + ' ' + agent.description).toLowerCase();
+				const text = document.createElement('div'); text.className = 'row-text';
+				const t = document.createElement('div'); t.className = 'row-title'; t.textContent = agent.label; text.appendChild(t);
+				const d = document.createElement('div'); d.className = 'row-desc'; d.textContent = agent.description; text.appendChild(d);
+				const s = document.createElement('div'); s.className = 'row-status'; s.id = 'agent_status_' + agent.provider; text.appendChild(s);
+				row.appendChild(text); row.appendChild(agentControl(agent));
+				sec.appendChild(row);
+			}
 			for (const f of FIELDS.filter(x => x.group === g)) {
 				const row = document.createElement('div'); row.className = 'row'; row.dataset.key = (f.label + ' ' + (f.description || '')).toLowerCase();
 				const text = document.createElement('div'); text.className = 'row-text';
@@ -369,6 +554,17 @@ const HTML_TEMPLATE = /* html */ `<!DOCTYPE html>
 		}
 	}
 
+	function setAgentLoading(provider, loading) {
+		if (loading) { loadingAgents.add(provider); }
+		else { loadingAgents.delete(provider); }
+		const row = document.querySelector('.agent-row[data-provider="' + provider + '"]');
+		if (row) { row.classList.toggle('loading', loading); }
+		const status = $('agent_status_' + provider);
+		if (status && loading) { status.textContent = NLS.loading; }
+		const cb = $('agent_' + provider);
+		if (cb) { cb.disabled = loading; }
+	}
+
 	function applyValues(state) {
 		const form = $('form');
 		if (!state.available) {
@@ -380,6 +576,25 @@ const HTML_TEMPLATE = /* html */ `<!DOCTYPE html>
 		$('notice').textContent = '';
 		form.classList.remove('disabled');
 		const values = state.values || {};
+		const agentState = new Map((state.agents || []).map(agent => [agent.provider, agent]));
+		for (const agent of AGENTS) {
+			const current = agentState.get(agent.provider);
+			const loading = loadingAgents.has(agent.provider);
+			const cb = $('agent_' + agent.provider);
+			if (cb && !loading) {
+				cb.checked = !!current?.active;
+				cb.disabled = false;
+			}
+			const status = $('agent_status_' + agent.provider);
+			if (status && !loading) {
+				const modelCount = current?.models?.length || 0;
+				status.textContent = current?.active
+					? (modelCount ? NLS.models.replace('{0}', String(modelCount)) + ': ' + current.models.join(', ') : NLS.on)
+					: NLS.off;
+			}
+			const row = document.querySelector('.agent-row[data-provider="' + agent.provider + '"]');
+			if (row && !loading) { row.classList.remove('loading'); }
+		}
 		for (const f of FIELDS) {
 			const el = $('f_' + f.key);
 			if (!el) { continue; }
@@ -424,6 +639,10 @@ const HTML_TEMPLATE = /* html */ `<!DOCTYPE html>
 	window.addEventListener('message', e => {
 		const m = e.data;
 		if (m.type === 'state') { applyValues(m); }
+		else if (m.type === 'agentLoading') { setAgentLoading(m.provider, !!m.loading); }
+		else if (m.type === 'error') {
+			for (const provider of [...loadingAgents]) { setAgentLoading(provider, false); }
+		}
 		else if (m.type === 'saved') {
 			const el = $('savedMsg'); el.classList.add('show');
 			setTimeout(() => el.classList.remove('show'), 1400);

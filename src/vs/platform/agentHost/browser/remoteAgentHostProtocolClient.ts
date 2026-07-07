@@ -18,7 +18,7 @@ import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogService } from '../../log/common/log.js';
 import { FileSystemProviderErrorCode, toFileSystemProviderErrorCode } from '../../files/common/files.js';
 import { IConfigurationService } from '../../configuration/common/configuration.js';
-import { AgentSession, AgentHostCodexAgentEnabledSettingId, IAgentConnection, IAgentCreateChatOptions, IAgentCreateSessionConfig, IAgentResolveSessionConfigParams, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult, IMcpNotification } from '../common/agentService.js';
+import { AgentSession, AgentHostAntigravityAgentEnabledSettingId, AgentHostCodexAgentEnabledSettingId, AgentHostCodexFuguAgentEnabledSettingId, AgentHostCursorAgentEnabledSettingId, IAgentConnection, IAgentCreateChatOptions, IAgentCreateSessionConfig, IAgentResolveSessionConfigParams, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult, IMcpNotification } from '../common/agentService.js';
 import { createRemoteWatchHandle, type IRemoteWatchHandle } from '../common/agentHostFileSystemProvider.js';
 import { AgentSubscriptionManager, type IActiveSubscriptionInfo, type IAgentSubscription } from '../common/state/agentSubscription.js';
 import { agentHostAuthority, fromAgentHostUri, toAgentHostUri } from '../common/agentHostUri.js';
@@ -37,7 +37,7 @@ import { encodeBase64 } from '../../../base/common/buffer.js';
 import { ILoadEstimator, LoadEstimator } from '../../../base/parts/ipc/common/ipc.net.js';
 import { TELEMETRY_CRASH_REPORTER_SETTING_ID, TELEMETRY_OLD_SETTING_ID, TELEMETRY_SETTING_ID } from '../../telemetry/common/telemetry.js';
 import { getTelemetryLevel } from '../../telemetry/common/telemetryUtils.js';
-import { AgentHostTelemetryLevelConfigKey, AgentHostCodexEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, AgentHostTerminalAutoApproveEnabledConfigKey, AgentHostGlobalAutoApproveEnabledConfigKey, AgentHostAutoReplyEnabledConfigKey, AgentHostTerminalAutoApproveRulesConfigKey, getAgentHostTerminalAutoApproveRulesConfig, SESSION_SYNC_ENABLED_SETTING_ID, TERMINAL_AUTO_APPROVE_ENABLED_SETTING_ID, GLOBAL_AUTO_APPROVE_SETTING_ID, AUTO_REPLY_SETTING_ID, TERMINAL_AUTO_APPROVE_SETTING_ID, TERMINAL_IGNORE_DEFAULT_AUTO_APPROVE_RULES_SETTING_ID, telemetryLevelToAgentHostConfigValue } from '../common/agentHostSchema.js';
+import { AgentHostAntigravityAgentEnabledConfigKey, AgentHostTelemetryLevelConfigKey, AgentHostCodexEnabledConfigKey, AgentHostCodexFuguAgentEnabledConfigKey, AgentHostCursorAgentEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, AgentHostTerminalAutoApproveEnabledConfigKey, AgentHostGlobalAutoApproveEnabledConfigKey, AgentHostAutoReplyEnabledConfigKey, AgentHostTerminalAutoApproveRulesConfigKey, getAgentHostTerminalAutoApproveRulesConfig, SESSION_SYNC_ENABLED_SETTING_ID, TERMINAL_AUTO_APPROVE_ENABLED_SETTING_ID, GLOBAL_AUTO_APPROVE_SETTING_ID, AUTO_REPLY_SETTING_ID, TERMINAL_AUTO_APPROVE_SETTING_ID, TERMINAL_IGNORE_DEFAULT_AUTO_APPROVE_RULES_SETTING_ID, telemetryLevelToAgentHostConfigValue } from '../common/agentHostSchema.js';
 import type { OtlpExportLogsParams } from '../common/state/protocol/channels-otlp/notifications.js';
 import type { TelemetryCapabilities } from '../common/state/protocol/channels-otlp/state.js';
 import type { InitializeResult } from '../common/state/protocol/common/commands.js';
@@ -368,6 +368,14 @@ export class RemoteAgentHostProtocolClient extends Disposable implements IAgentC
 				}
 				this._updateCodexEnabled();
 			}
+			// FORK: forward the opt-in CLI provider toggles live; the host
+			// registers/unregisters the providers without a restart.
+			if (e.affectsConfiguration(AgentHostCursorAgentEnabledSettingId) || e.affectsConfiguration(AgentHostAntigravityAgentEnabledSettingId) || e.affectsConfiguration(AgentHostCodexFuguAgentEnabledSettingId)) {
+				if (this._state.kind !== AgentHostClientState.Connected) {
+					return;
+				}
+				this._updateCliAgentsEnabled();
+			}
 		}));
 
 		// Detect silently-dead transports — see {@link _resetLivenessTimers}.
@@ -460,6 +468,7 @@ export class RemoteAgentHostProtocolClient extends Disposable implements IAgentC
 		this._updateAutoReplyEnabled();
 		this._updateTerminalAutoApproveRules();
 		this._updateCodexEnabled();
+		this._updateCliAgentsEnabled();
 		this._transitionTo({ kind: AgentHostClientState.Connected });
 	}
 
@@ -839,8 +848,8 @@ export class RemoteAgentHostProtocolClient extends Disposable implements IAgentC
 		return this._sendRequest('getSessionLogs', { channel: session.toString() });
 	}
 
-	async pingAgent(): Promise<boolean> {
-		return this._sendRequest('pingAgent', { channel: ROOT_STATE_URI });
+	async pingAgent(provider?: string): Promise<boolean> {
+		return this._sendRequest('pingAgent', { channel: ROOT_STATE_URI, provider });
 	}
 
 	/**
@@ -1377,6 +1386,18 @@ export class RemoteAgentHostProtocolClient extends Disposable implements IAgentC
 		this.dispatchAction(ROOT_STATE_URI, {
 			type: ActionType.RootConfigChanged,
 			config: { [AgentHostCodexEnabledConfigKey]: enabled },
+		}, this._clientId, 0);
+	}
+
+	/** FORK: push the live enable state of the opt-in CLI providers (register/unregister without restart). */
+	private _updateCliAgentsEnabled(): void {
+		this.dispatchAction(ROOT_STATE_URI, {
+			type: ActionType.RootConfigChanged,
+			config: {
+				[AgentHostCursorAgentEnabledConfigKey]: this._configurationService.getValue<boolean>(AgentHostCursorAgentEnabledSettingId) === true,
+				[AgentHostAntigravityAgentEnabledConfigKey]: this._configurationService.getValue<boolean>(AgentHostAntigravityAgentEnabledSettingId) === true,
+				[AgentHostCodexFuguAgentEnabledConfigKey]: this._configurationService.getValue<boolean>(AgentHostCodexFuguAgentEnabledSettingId) === true,
+			},
 		}, this._clientId, 0);
 	}
 

@@ -19,6 +19,7 @@ import { INativeEnvironmentService } from '../../environment/common/environment.
 import { FileOperationError, FileOperationResult, IFileService, toFileOperationResult } from '../../files/common/files.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
 import { ILogService } from '../../log/common/log.js';
+import { IAgentSdkProductConfig } from '../../../base/common/product.js';
 import { IProductService } from '../../product/common/productService.js';
 import { IRequestService } from '../../request/common/request.js';
 import { IRequestContext } from '../../../base/parts/request/common/request.js';
@@ -112,6 +113,29 @@ export function resolveSdkTarget(
 		return `linux-${host.arch}-musl`;
 	}
 	return `${host.platform}-${host.arch}`;
+}
+
+/**
+ * FORK: one tarball of a resolved download plan — where to fetch it from and
+ * where its payload lands inside the SDK cache dir. `urlTemplate` configs
+ * produce a single root entry; `npmPackages` configs produce one entry per
+ * package, re-homed under `node_modules/<name>` (npm registry tarballs carry
+ * a `package/` top-level dir, hence `stripComponents: 1`).
+ */
+interface IDownloadPlanEntry {
+	readonly url: string;
+	/** Path relative to the cache root to extract into; `''` = the root itself. */
+	readonly extractInto: string;
+	readonly stripComponents: number;
+}
+
+/**
+ * FORK: npm registry tarball URL for a package version. Scoped names drop the
+ * scope in the tarball basename: `@scope/name` → `.../@scope/name/-/name-1.2.3.tgz`.
+ */
+export function npmTarballUrl(name: string, version: string, registry = 'https://registry.npmjs.org'): string {
+	const basename = name.startsWith('@') ? name.split('/')[1] : name;
+	return `${registry.replace(/\/+$/, '')}/${name}/-/${basename}-${version}.tgz`;
 }
 
 // #endregion
@@ -337,18 +361,7 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 				`Set ${pkg.devOverrideEnvVar} to a local SDK root to bypass.`,
 			);
 		}
-		const url = format2(config.urlTemplate, { sdkTarget });
-		// `format2` leaves unknown `{placeholder}` segments untouched; catch
-		// vscode-distro typos like `{sdkTaret}` here instead of letting the
-		// CDN return a 404 against a clearly-broken URL.
-		const stray = /{[^}]+}/.exec(url);
-		if (stray) {
-			throw new Error(
-				`Cannot load ${pkg.id} SDK: \`product.agentSdks.${pkg.id}.urlTemplate\` ` +
-				`contains an unknown placeholder ${stray[0]} — only {sdkTarget} is substituted. ` +
-				`Template: ${config.urlTemplate}`,
-			);
-		}
+		const plan = this._buildDownloadPlan(pkg, config, sdkTarget);
 
 		const cacheDir = this._cacheDir(pkg.id, config.version, sdkTarget);
 		const sentinel = URI.joinPath(URI.file(cacheDir), '.complete');
@@ -366,12 +379,59 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 		// as the dedup key without an extra string allocation.
 		let pending = this._pendingDownloads.get(cacheDir);
 		if (!pending) {
-			pending = this._download(pkg, url, cacheDir, sentinel, token).finally(() => {
+			pending = this._download(pkg, plan, cacheDir, sentinel, token).finally(() => {
 				this._pendingDownloads.delete(cacheDir);
 			});
 			this._pendingDownloads.set(cacheDir, pending);
 		}
 		return pending;
+	}
+
+	/**
+	 * Resolves the product config into the list of tarballs to fetch and where
+	 * each extracts inside the cache dir. `urlTemplate` mode is the original
+	 * single-tarball contract (custom-built tarball, extracted at the root).
+	 * FORK: `npmPackages` mode fetches each named package's tarball for
+	 * `config.version` straight from the npm registry and re-homes its
+	 * `package/` payload under `node_modules/<name>`, producing the same
+	 * `node_modules`-shaped root the SDK loaders expect — without this build
+	 * having to host (redistribute) the SDK bits anywhere.
+	 */
+	private _buildDownloadPlan(pkg: IAgentSdkPackage, config: IAgentSdkProductConfig, sdkTarget: string): IDownloadPlanEntry[] {
+		if (!!config.urlTemplate === !!config.npmPackages?.length) {
+			throw new Error(
+				`Cannot load ${pkg.id} SDK: \`product.agentSdks.${pkg.id}\` must set exactly one of ` +
+				`\`urlTemplate\` or \`npmPackages\`.`,
+			);
+		}
+		const substituteAndCheck = (template: string, what: string): string => {
+			const value = format2(template, { sdkTarget });
+			// `format2` leaves unknown `{placeholder}` segments untouched; catch
+			// vscode-distro typos like `{sdkTaret}` here instead of letting the
+			// registry return a 404 against a clearly-broken URL.
+			const stray = /{[^}]+}/.exec(value);
+			if (stray) {
+				throw new Error(
+					`Cannot load ${pkg.id} SDK: \`product.agentSdks.${pkg.id}.${what}\` ` +
+					`contains an unknown placeholder ${stray[0]} — only {sdkTarget} is substituted. ` +
+					`Template: ${template}`,
+				);
+			}
+			return value;
+		};
+		if (config.urlTemplate) {
+			return [{ url: substituteAndCheck(config.urlTemplate, 'urlTemplate'), extractInto: '', stripComponents: 0 }];
+		}
+		return config.npmPackages!.map(nameTemplate => {
+			const name = substituteAndCheck(nameTemplate, 'npmPackages');
+			return {
+				url: npmTarballUrl(name, config.version, config.npmRegistry),
+				// npm tarballs carry a single `package/` top-level dir; strip it
+				// and land the payload where a real `npm install` would.
+				extractInto: path.join('node_modules', name),
+				stripComponents: 1,
+			};
+		});
 	}
 
 	private _cacheDir(packageId: string, sdkVersion: string, sdkTarget: string): string {
@@ -390,12 +450,12 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 
 	private async _download(
 		pkg: IAgentSdkPackage,
-		url: string,
+		plan: readonly IDownloadPlanEntry[],
 		cacheDir: string,
 		sentinel: URI,
 		token: CancellationToken,
 	): Promise<string> {
-		this._logService.info(`[AgentSdkDownloader] ${pkg.id}: downloading from ${url}`);
+		this._logService.info(`[AgentSdkDownloader] ${pkg.id}: downloading from ${plan.map(e => e.url).join(', ')}`);
 		const start = Date.now();
 		const parent = path.dirname(cacheDir);
 		await this._fileService.createFolder(URI.file(parent));
@@ -413,20 +473,34 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 		// Fire the download lifecycle on the process-global event so a single
 		// subscriber (the protocol server) can forward it to clients. One
 		// `started`, throttled `progress` from `_fetch`, then a terminal frame.
+		// For multi-tarball plans, receivedBytes accumulates across tarballs
+		// and totalBytes stays undefined (indeterminate) — per-file totals
+		// are only known once each response arrives.
 		const downloadId = generateUuid();
 		let lastReceived = 0;
 		let lastTotal: number | undefined;
+		let currentUrl = plan[0].url;
 		this._fireProgress(pkg, downloadId, 'started', 0, undefined);
 
 		try {
-			const tarballPath = path.join(tmpDir, 'sdk.tgz');
-			await this._fetch(url, tarballPath, token, (receivedBytes, totalBytes) => {
-				lastReceived = receivedBytes;
-				lastTotal = totalBytes;
-				this._fireProgress(pkg, downloadId, 'progress', receivedBytes, totalBytes);
-			});
-			await this._extractTarGz(tarballPath, tmpDir);
-			await this._fileService.del(URI.file(tarballPath));
+			const singleTarball = plan.length === 1;
+			let receivedBase = 0;
+			for (const entry of plan) {
+				currentUrl = entry.url;
+				const tarballPath = path.join(tmpDir, 'sdk.tgz');
+				await this._fetch(entry.url, tarballPath, token, (receivedBytes, totalBytes) => {
+					lastReceived = receivedBase + receivedBytes;
+					lastTotal = singleTarball ? totalBytes : undefined;
+					this._fireProgress(pkg, downloadId, 'progress', lastReceived, lastTotal);
+				});
+				const extractDir = entry.extractInto ? path.join(tmpDir, entry.extractInto) : tmpDir;
+				if (entry.extractInto) {
+					await this._fileService.createFolder(URI.file(extractDir));
+				}
+				await this._extractTarGz(tarballPath, extractDir, entry.stripComponents);
+				await this._fileService.del(URI.file(tarballPath));
+				receivedBase = lastReceived;
+			}
 
 			// Write the `.complete` sentinel inside the tmp dir BEFORE the
 			// move so the move atomically publishes a directory that
@@ -465,7 +539,7 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 			const message = err instanceof Error ? err.message : String(err);
 			this._fireProgress(pkg, downloadId, 'failed', lastReceived, lastTotal, message);
 			throw new Error(
-				`Failed to download ${pkg.id} SDK from ${url} ` +
+				`Failed to download ${pkg.id} SDK from ${currentUrl} ` +
 				`(cache target: ${cacheDir}). ` +
 				`Set ${pkg.devOverrideEnvVar} to a local SDK root to bypass. ` +
 				`Cause: ${message}`,
@@ -605,10 +679,10 @@ export class AgentSdkDownloader extends Disposable implements IAgentSdkDownloade
 		});
 	}
 
-	private async _extractTarGz(tarball: string, dest: string): Promise<void> {
+	private async _extractTarGz(tarball: string, dest: string, stripComponents = 0): Promise<void> {
 		// `tar` (node-tar) is pure JS — works on every platform the agent host
 		// runs on without depending on a system `tar` binary.
-		await tar.x({ file: tarball, cwd: dest });
+		await tar.x({ file: tarball, cwd: dest, strip: stripComponents });
 	}
 
 	private async _delIgnoringMissing(uri: URI): Promise<void> {

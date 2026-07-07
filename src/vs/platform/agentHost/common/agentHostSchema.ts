@@ -400,6 +400,17 @@ export const AgentHostSessionSyncEnabledConfigKey = 'sessionSyncEnabled';
 export const AgentHostCodexEnabledConfigKey = 'codexAgentEnabled';
 
 /**
+ * FORK: root config keys forwarded from the renderer carrying the live values
+ * of the opt-in CLI provider settings (`chat.agentHost.cursorAgent.enabled`,
+ * `chat.agentHost.antigravityAgent.enabled`,
+ * `chat.agentHost.codexFuguAgent.enabled`). Unlike Codex, these providers
+ * register AND unregister live — no agent host restart needed.
+ */
+export const AgentHostCursorAgentEnabledConfigKey = 'cursorAgentEnabled';
+export const AgentHostAntigravityAgentEnabledConfigKey = 'antigravityAgentEnabled';
+export const AgentHostCodexFuguAgentEnabledConfigKey = 'codexFuguAgentEnabled';
+
+/**
  * Root config key forwarded from the renderer when VS Code's
  * `chat.tools.terminal.enableAutoApprove` setting changes. Controls whether
  * agent-host shell permission checks may apply terminal auto-approve rules.
@@ -661,6 +672,24 @@ export const platformRootSchema = createSchema({
 		type: 'boolean',
 		title: localize('agentHost.config.codexAgentEnabled.title', "Codex Agent"),
 		description: localize('agentHost.config.codexAgentEnabled.description', "Whether the Codex provider is enabled."),
+		default: false,
+	}),
+	[AgentHostCursorAgentEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.cursorAgentEnabled.title', "Cursor Agent"),
+		description: localize('agentHost.config.cursorAgentEnabled.description', "Whether the Cursor Agent CLI provider is enabled."),
+		default: false,
+	}),
+	[AgentHostAntigravityAgentEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.antigravityAgentEnabled.title', "Antigravity"),
+		description: localize('agentHost.config.antigravityAgentEnabled.description', "Whether the Antigravity CLI provider is enabled."),
+		default: false,
+	}),
+	[AgentHostCodexFuguAgentEnabledConfigKey]: schemaProperty<boolean>({
+		type: 'boolean',
+		title: localize('agentHost.config.codexFuguAgentEnabled.title', "Codex Fugu"),
+		description: localize('agentHost.config.codexFuguAgentEnabled.description', "Whether the Codex Fugu CLI provider is enabled."),
 		default: false,
 	}),
 	[AgentHostTerminalAutoApproveEnabledConfigKey]: schemaProperty<boolean>({

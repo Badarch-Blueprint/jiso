@@ -53,7 +53,7 @@ export class NullAgentHostService implements IAgentHostService {
 	async getPlanUsage(): Promise<IClaudePlanUsage | undefined> { return undefined; }
 	async getContextUsage(_session: URI): Promise<IClaudeContextUsage | undefined> { return undefined; }
 	async getSessionLogs(_session: URI): Promise<IClaudeSessionLogs | undefined> { return undefined; }
-	async pingAgent(): Promise<boolean> { return false; }
+	async pingAgent(_provider?: string): Promise<boolean> { return false; }
 	async getCompletionTriggerCharacters(): Promise<readonly string[]> { return []; }
 	async startWebSocketServer(): Promise<IAgentHostSocketInfo> { return notSupported(); }
 	async getInspectInfo(_tryEnable: boolean): Promise<IAgentHostInspectInfo | undefined> { return undefined; }

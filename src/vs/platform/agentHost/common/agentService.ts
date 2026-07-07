@@ -86,6 +86,33 @@ export const AgentHostClaudeAgentEnabledSettingId = 'chat.agentHost.claudeAgent.
 export const AgentHostCodexAgentEnabledSettingId = 'chat.agentHost.codexAgent.enabled';
 
 /**
+ * FORK: configuration key controlling whether the Cursor Agent provider is
+ * registered in the agent host process. When `false` (the default), the agent
+ * host skips registering the provider regardless of the `cursor-agent` CLI
+ * being installed. The agent host process must be restarted for changes to
+ * take effect.
+ */
+export const AgentHostCursorAgentEnabledSettingId = 'chat.agentHost.cursorAgent.enabled';
+
+/**
+ * FORK: configuration key controlling whether the Antigravity provider is
+ * registered in the agent host process. When `false` (the default), the agent
+ * host skips registering the provider regardless of the `agy` CLI being
+ * installed. The agent host process must be restarted for changes to take
+ * effect.
+ */
+export const AgentHostAntigravityAgentEnabledSettingId = 'chat.agentHost.antigravityAgent.enabled';
+
+/**
+ * FORK: configuration key controlling whether the Codex Fugu provider is
+ * registered in the agent host process. When `false` (the default), the agent
+ * host skips registering the provider regardless of the `codex-fugu` CLI
+ * being installed. The agent host process must be restarted for changes to
+ * take effect.
+ */
+export const AgentHostCodexFuguAgentEnabledSettingId = 'chat.agentHost.codexFuguAgent.enabled';
+
+/**
  * Optional override that points at an **SDK root directory** containing a
  * `node_modules/@anthropic-ai/claude-agent-sdk` subtree. When set, the agent
  * host loads the Claude SDK from that path instead of the bare import (which
@@ -109,6 +136,27 @@ export const AgentHostClaudeAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_CLAUDE_AGENT
  * `'false'`; absent means "default" (`false`).
  */
 export const AgentHostCodexAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_CODEX_AGENT_ENABLED';
+
+/**
+ * FORK: environment variable form of {@link AgentHostCursorAgentEnabledSettingId}.
+ * Set by the agent host starters from the setting. Accepts `'true'` /
+ * `'false'`; absent means "default" (`false`).
+ */
+export const AgentHostCursorAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_CURSOR_AGENT_ENABLED';
+
+/**
+ * FORK: environment variable form of {@link AgentHostAntigravityAgentEnabledSettingId}.
+ * Set by the agent host starters from the setting. Accepts `'true'` /
+ * `'false'`; absent means "default" (`false`).
+ */
+export const AgentHostAntigravityAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_ANTIGRAVITY_AGENT_ENABLED';
+
+/**
+ * FORK: environment variable form of {@link AgentHostCodexFuguAgentEnabledSettingId}.
+ * Set by the agent host starters from the setting. Accepts `'true'` /
+ * `'false'`; absent means "default" (`false`).
+ */
+export const AgentHostCodexFuguAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_CODEX_FUGU_AGENT_ENABLED';
 
 /**
  * Resolves the effective enable state for a Claude/Codex provider from the
@@ -233,6 +281,17 @@ export function shouldSurfaceLocalAgentHostProvider(provider: AgentProvider, _co
  */
 export function isLocalClaudeProvider(provider: string): boolean {
 	return provider === 'claude' || provider === 'claude-cli';
+}
+
+/**
+ * FORK: providers whose agent authenticates through the user's own locally
+ * installed CLI login (Claude's `claude /login`, Cursor's `cursor-agent login`,
+ * Antigravity's Google sign-in). None of them involve GitHub Copilot, so UI
+ * (chat gating, model picker) must never offer a Copilot sign-in for their
+ * sessions.
+ */
+export function isOwnLoginCliProvider(provider: string): boolean {
+	return isLocalClaudeProvider(provider) || provider === 'cursor-agent' || provider === 'antigravity' || provider === 'codex-fugu';
 }
 
 // -- Codex agent settings --------------------------------------------------------
@@ -551,6 +610,9 @@ export interface IAgentSdkStarterSettings {
 	readonly codexBinaryArgs?: readonly string[];
 	readonly claudeAgentEnabled?: boolean;
 	readonly codexAgentEnabled?: boolean;
+	readonly cursorAgentEnabled?: boolean;
+	readonly antigravityAgentEnabled?: boolean;
+	readonly codexFuguAgentEnabled?: boolean;
 }
 
 export function buildAgentSdkEnv(
@@ -574,6 +636,15 @@ export function buildAgentSdkEnv(
 	}
 	if (settings.codexAgentEnabled !== undefined) {
 		setIfMissing(AgentHostCodexAgentEnabledEnvVar, settings.codexAgentEnabled ? 'true' : 'false');
+	}
+	if (settings.cursorAgentEnabled !== undefined) {
+		setIfMissing(AgentHostCursorAgentEnabledEnvVar, settings.cursorAgentEnabled ? 'true' : 'false');
+	}
+	if (settings.antigravityAgentEnabled !== undefined) {
+		setIfMissing(AgentHostAntigravityAgentEnabledEnvVar, settings.antigravityAgentEnabled ? 'true' : 'false');
+	}
+	if (settings.codexFuguAgentEnabled !== undefined) {
+		setIfMissing(AgentHostCodexFuguAgentEnabledEnvVar, settings.codexFuguAgentEnabled ? 'true' : 'false');
 	}
 	return out;
 }
@@ -1450,7 +1521,7 @@ export interface IAgentService {
 	getSessionLogs(session: URI): Promise<IClaudeSessionLogs | undefined>;
 
 	/** FORK: run one minimal throwaway turn to start the subscription's 5-hour usage window; `true` on success. */
-	pingAgent(): Promise<boolean>;
+	pingAgent(provider?: AgentProvider): Promise<boolean>;
 
 	/** Dispose a session in the agent host, freeing SDK resources. */
 	disposeSession(session: URI): Promise<void>;
@@ -1714,7 +1785,7 @@ export interface IAgentConnection {
 	/** FORK: harness-diagnostics log for a session (context trimming / auto-compact / context usage); `undefined` when unavailable. */
 	getSessionLogs(session: URI): Promise<IClaudeSessionLogs | undefined>;
 	/** FORK: run one minimal throwaway turn to start the subscription's 5-hour usage window; `true` on success. */
-	pingAgent(): Promise<boolean>;
+	pingAgent(provider?: AgentProvider): Promise<boolean>;
 	disposeSession(session: URI): Promise<void>;
 
 	/**

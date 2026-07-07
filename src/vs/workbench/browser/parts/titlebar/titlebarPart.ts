@@ -884,7 +884,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 	private get activityActionsEnabled(): boolean {
 		// FORK: never surface the Accounts (person) and Manage (gear) items in
 		// the title bar — JisoIDE keeps the top bar Claude-focused. Settings
-		// stay reachable via the command palette and the Claude Settings
+		// stay reachable via the command palette and the Jiso Settings
 		// panel's "Open VS Code Settings" entry; accounts via the command
 		// palette. Stock behavior (shown when the activity bar is at the
 		// top/bottom) is preserved below for restoration:

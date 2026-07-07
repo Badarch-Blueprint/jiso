@@ -339,6 +339,13 @@ function getVisibleNonLocalEditorChatSessionTypes(
 
 export const MANAGE_CHAT_COMMAND_ID = 'workbench.action.chat.manage';
 
+/**
+ * FORK: opens a new chat session of another local agent (e.g. Cursor Agent,
+ * Antigravity) in place — sidebar chats stay in the sidebar. Invoked by the
+ * model picker when the user picks a model that belongs to a different agent.
+ */
+export const OPEN_AGENT_SESSION_WITH_MODEL_COMMAND_ID = 'workbench.action.chat.openAgentSessionWithModel';
+
 export const OPEN_WORKSPACE_IN_AGENTS_WINDOW_COMMAND_ID = 'workbench.action.openWorkspaceInAgentsWindow';
 export const OPEN_AGENTS_WINDOW_COMMAND_ID = 'workbench.action.openAgentsWindow';
 export const OPEN_AGENTS_WINDOW_PRECONDITION = ContextKeyExpr.and(

@@ -7,8 +7,9 @@ import { Codicon } from '../../../../../../base/common/codicons.js';
 import { Event } from '../../../../../../base/common/event.js';
 import { Disposable, DisposableMap, DisposableStore, toDisposable } from '../../../../../../base/common/lifecycle.js';
 import { ThemeIcon } from '../../../../../../base/common/themables.js';
-import { localize } from '../../../../../../nls.js';
-import { AgentHostEnabledSettingId, claudePreferAgentHostSettingId, IAgentHostService, isLocalClaudeProvider, shouldSurfaceLocalAgentHostProvider, type AgentProvider } from '../../../../../../platform/agentHost/common/agentService.js';
+import { localize, localize2 } from '../../../../../../nls.js';
+import { Action2, registerAction2 } from '../../../../../../platform/actions/common/actions.js';
+import { AgentHostEnabledSettingId, claudePreferAgentHostSettingId, IAgentHostService, isLocalClaudeProvider, isOwnLoginCliProvider, shouldSurfaceLocalAgentHostProvider, type AgentProvider } from '../../../../../../platform/agentHost/common/agentService.js';
 import { type ProtectedResourceMetadata } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
 import { type AgentInfo, type RootState } from '../../../../../../platform/agentHost/common/state/sessionState.js';
 import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
@@ -20,6 +21,9 @@ import { IWorkbenchContribution } from '../../../../../common/contributions.js';
 import { IAgentHostFileSystemService } from '../../../../../services/agentHost/common/agentHostFileSystemService.js';
 import { IAuthenticationService } from '../../../../../services/authentication/common/authentication.js';
 import { IWorkbenchEnvironmentService } from '../../../../../services/environment/common/environmentService.js';
+import { CHAT_CATEGORY } from '../../actions/chatActions.js';
+import { ChatSessionPosition, openChatSession } from '../../chatSessions/chatSessions.contribution.js';
+import { ChatContextKeys } from '../../../common/actions/chatContextKeys.js';
 import { ChatSessionsExtensions, IAsyncChatSessionActivationRegistry, IChatSessionsService, isLocalAgentHostTarget } from '../../../common/chatSessionsService.js';
 import { ICustomizationHarnessService } from '../../../common/customizationHarnessService.js';
 import { ILanguageModelsService } from '../../../common/languageModels.js';
@@ -237,16 +241,22 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
 			canDelegate: true,
 			requiresCustomModels: true,
 			supportsAutoModel: agentHostProviderSupportsAutoModel(agent.provider),
-			// FORK: the local Claude providers authenticate via the user's own `claude` login
-			// (no Copilot account / protected resources), so they must not be gated behind
-			// GitHub Copilot sign-in. All other agent-host providers still are.
-			requiresCopilotSignIn: !isLocalClaudeProvider(agent.provider),
-			// FORK: give a fresh local-Claude session its own welcome — the Claude mark plus
-			// copy that reflects a local, interactive agent, instead of the generic
+			// FORK: providers backed by the user's own locally-installed CLI login (Claude,
+			// Cursor Agent, Antigravity) have no Copilot account / protected resources, so
+			// they must not be gated behind GitHub Copilot sign-in. All other agent-host
+			// providers still are.
+			requiresCopilotSignIn: !isOwnLoginCliProvider(agent.provider),
+			// FORK: give fresh own-login CLI sessions their own welcome — copy that
+			// reflects a local, interactive agent, instead of the generic
 			// "Delegate to … / forwarded to a coding agent in the background" message.
+			// Claude additionally gets its mark and subscription-specific copy.
 			icon: isLocalClaudeProvider(agent.provider) ? { light: CLAUDE_CLI_LOGO_DATA_URI, dark: CLAUDE_CLI_LOGO_DATA_URI } : undefined,
-			welcomeTitle: isLocalClaudeProvider(agent.provider) ? localize('claudeCli.welcomeTitle', "Claude Code") : undefined,
-			welcomeMessage: isLocalClaudeProvider(agent.provider) ? localize('claudeCli.welcomeMessage', "Ask Claude Code to explore, edit, and run code in your workspace, powered by your own Claude subscription.") : undefined,
+			welcomeTitle: isLocalClaudeProvider(agent.provider)
+				? localize('claudeCli.welcomeTitle', "Claude Code")
+				: isOwnLoginCliProvider(agent.provider) ? agent.displayName : undefined,
+			welcomeMessage: isLocalClaudeProvider(agent.provider)
+				? localize('claudeCli.welcomeMessage', "Ask Claude Code to explore, edit, and run code in your workspace, powered by your own Claude subscription.")
+				: isOwnLoginCliProvider(agent.provider) ? localize('ownLoginCli.welcomeMessage', "Ask {0} to explore, edit, and run code in your workspace, powered by your own local {0} CLI login.", agent.displayName) : undefined,
 			agentHostProviderId: agent.provider,
 			supportsDelegation: true,
 			capabilities: {
@@ -255,6 +265,32 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
 				supportsImageAttachments: true,
 			},
 		}));
+
+		// FORK: palette entry point for the editor window. The session-type
+		// picker ("New session in … with …") only exists in the Agents window,
+		// so without a command there is no IDE UI at all to start a session for
+		// the opt-in own-login CLI providers (Cursor Agent, Antigravity, …).
+		// Local Claude is excluded — it is the editor window's default panel
+		// agent, so a duplicate "New Claude Session" entry would only confuse.
+		if (!this._isSessionsWindow && isOwnLoginCliProvider(agent.provider) && !isLocalClaudeProvider(agent.provider)) {
+			const displayName = agent.displayName;
+			store.add(registerAction2(class OpenNewAgentHostSessionEditorAction extends Action2 {
+				constructor() {
+					super({
+						id: `workbench.action.chat.openNewSessionEditor.${sessionType}`,
+						title: localize2('agentHost.openNewSessionEditor', "New {0} Session", displayName),
+						category: CHAT_CATEGORY,
+						icon: Codicon.plus,
+						f1: true,
+						precondition: ChatContextKeys.enabled,
+					});
+				}
+
+				run(accessor: ServicesAccessor): Promise<void> {
+					return openChatSession(accessor, { type: sessionType, displayName, position: ChatSessionPosition.Editor });
+				}
+			}));
+		}
 
 		const agentRegistration = store.add(this._activeClientService.registerForAgent(sessionType));
 		const syncProvider = agentRegistration.syncProvider;

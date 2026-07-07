@@ -15,8 +15,8 @@ import { URI } from '../../../base/common/uri.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import * as os from 'os';
 import * as inspector from 'inspector';
-import { AgentHostClaudeAgentEnabledEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostIpcChannels, IAgentHostInspectInfo, IAgentHostSocketInfo, IAgentService, IConnectionTrackerService, isAgentEnabled } from '../common/agentService.js';
-import { AgentHostCodexEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
+import { AgentHostClaudeAgentEnabledEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostCodexFuguAgentEnabledEnvVar, AgentHostCursorAgentEnabledEnvVar, AgentHostIpcChannels, IAgentHostInspectInfo, IAgentHostSocketInfo, IAgentService, IConnectionTrackerService, isAgentEnabled } from '../common/agentService.js';
+import { AgentHostCodexEnabledConfigKey, AgentHostCodexFuguAgentEnabledConfigKey, AgentHostCursorAgentEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
 import { AgentService } from './agentService.js';
 import { IAgentConfigurationService } from './agentConfigurationService.js';
 import { IAgentHostCompletions } from './agentHostCompletions.js';
@@ -26,6 +26,8 @@ import { CopilotBranchNameGenerator, ICopilotBranchNameGenerator } from './copil
 import { CopilotApiService, ICopilotApiService } from './shared/copilotApiService.js';
 import { ClaudeAgent } from './claude/claudeAgent.js';
 import { ClaudeCliAgent, isClaudeCliAvailable } from './claude/claudeCliAgent.js';
+import { CursorCliAgent, isCursorAgentCliAvailable } from './cursor/cursorCliAgent.js';
+import { CodexFuguCliAgent, isCodexFuguCliAvailable } from './codexFugu/codexFuguCliAgent.js';
 import { ClaudeAgentSdkService, ClaudeSdkPackage, IClaudeAgentSdkService, isClaudeSdkModuleBundled } from './claude/claudeAgentSdkService.js';
 import { ClaudeProxyService, IClaudeProxyService } from './claude/claudeProxyService.js';
 import { CodexAgent, CodexSdkPackage } from './codex/codexAgent.js';
@@ -90,11 +92,18 @@ void startAgentHost().catch(err => {
 
 async function startAgentHost(): Promise<void> {
 	// Setup RPC - supports both Electron utility process and Node child process
+	// FORK: the main `agentHost` channel is registered only after every service
+	// and agent provider below is constructed, which can take well over the IPC
+	// layer's default 1s pending-request timeout (slow disks, CLI PATH probes).
+	// A renderer that connects during that window would get its initial requests
+	// (root-state subscribe, listSessions) rejected with "Unknown channel", so
+	// give queued requests a generous grace period instead.
+	const channelRequestTimeout = 60_000;
 	let server: ChildProcessServer<string> | UtilityProcessServer;
 	if (isUtilityProcess(process)) {
-		server = new UtilityProcessServer();
+		server = new UtilityProcessServer(undefined, channelRequestTimeout);
 	} else {
-		server = new ChildProcessServer(AgentHostIpcChannels.AgentHost);
+		server = new ChildProcessServer(AgentHostIpcChannels.AgentHost, channelRequestTimeout);
 	}
 
 	const disposables = new DisposableStore();
@@ -236,6 +245,39 @@ async function startAgentHost(): Promise<void> {
 		// Copilot-proxied SDK `ClaudeAgent`. Registered only when `claude` is on PATH.
 		if (isClaudeCliAvailable()) {
 			agentService.registerProvider(instantiationService.createInstance(ClaudeCliAgent));
+		}
+		// FORK: opt-in third-party CLI providers, default off. Unlike Codex these
+		// register AND unregister live: the renderer forwards the settings-panel
+		// toggles as root config, which wins over the spawn-time env var. A
+		// provider only ever registers when its CLI is on PATH.
+		{
+			const agentConfigurationService = agentService.configurationService;
+			const registerLiveCliProvider = (providerId: string, enabled: () => boolean, isAvailable: () => boolean, create: () => Parameters<typeof agentService.registerProvider>[0]) => {
+				let registered = false;
+				const sync = () => {
+					const shouldEnable = enabled();
+					if (shouldEnable && !registered && isAvailable()) {
+						registered = true;
+						agentService.registerProvider(create());
+					} else if (!shouldEnable && registered) {
+						registered = false;
+						agentService.unregisterProvider(providerId);
+					}
+				};
+				sync();
+				disposables.add(agentConfigurationService.onDidRootConfigChange(() => sync()));
+			};
+			const liveEnabled = (configKey: 'cursorAgentEnabled' | 'antigravityAgentEnabled' | 'codexFuguAgentEnabled', envVar: string) => (): boolean => {
+				const rootValue = agentConfigurationService.getRootValue(platformRootSchema, configKey);
+				return rootValue !== undefined ? rootValue === true : isAgentEnabled(process.env[envVar], false);
+			};
+			registerLiveCliProvider('cursor-agent', liveEnabled(AgentHostCursorAgentEnabledConfigKey, AgentHostCursorAgentEnabledEnvVar), isCursorAgentCliAvailable, () => instantiationService.createInstance(CursorCliAgent));
+			// FORK: Antigravity provider disabled 2026-07 — Google has permanently banned
+			// accounts for driving Antigravity via third-party tools and has not clarified
+			// whether headless automation of the official `agy` CLI is exempt. Re-enable
+			// only once Google's policy explicitly allows it.
+			// registerLiveCliProvider('antigravity', liveEnabled(AgentHostAntigravityAgentEnabledConfigKey, AgentHostAntigravityAgentEnabledEnvVar), isAntigravityCliAvailable, () => instantiationService.createInstance(AntigravityCliAgent));
+			registerLiveCliProvider('codex-fugu', liveEnabled(AgentHostCodexFuguAgentEnabledConfigKey, AgentHostCodexFuguAgentEnabledEnvVar), isCodexFuguCliAvailable, () => instantiationService.createInstance(CodexFuguCliAgent));
 		}
 	} catch (err) {
 		logService.error('Failed to create AgentService', err);

@@ -22,7 +22,7 @@ import { ChannelClient as IPCClient, ChannelServer as IPCServer, IChannel, IChan
  */
 
 export class Server<TContext extends string> extends IPCServer<TContext> {
-	constructor(ctx: TContext) {
+	constructor(ctx: TContext, timeoutDelay?: number) {
 		super({
 			send: r => {
 				try {
@@ -30,7 +30,7 @@ export class Server<TContext extends string> extends IPCServer<TContext> {
 				} catch (e) { /* not much to do */ }
 			},
 			onMessage: Event.fromNodeEventEmitter(process, 'message', msg => VSBuffer.wrap(Buffer.from(msg, 'base64')))
-		}, ctx);
+		}, ctx, null, timeoutDelay);
 
 		process.once('disconnect', () => this.dispose());
 	}

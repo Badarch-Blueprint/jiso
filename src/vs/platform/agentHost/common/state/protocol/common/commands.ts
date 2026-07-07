@@ -905,6 +905,8 @@ export interface GetPlanUsageParams extends BaseParams {
  */
 export interface PingAgentParams extends BaseParams {
 	channel: 'ahp-root://';
+	/** Optional provider id. Omit to ping the first provider that supports it. */
+	provider?: string;
 }
 
 /**

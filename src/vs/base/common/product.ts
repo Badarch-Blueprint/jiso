@@ -77,10 +77,21 @@ export type ExtensionVirtualWorkspaceSupport = {
  *
  * See `src/vs/platform/agentHost/node/claude/roadmap.md` Phase 15 for
  * the rationale (macOS Universal compatibility, trust model).
+ *
+ * FORK: `npmPackages` is an alternative to `urlTemplate` for builds that
+ * cannot host (redistribute) the SDK tarballs themselves. Each entry is
+ * an npm package name (with optional `{sdkTarget}` placeholder); the
+ * downloader fetches each package's tarball for `version` straight from
+ * the npm registry — the vendor's own distribution channel — and lays
+ * them out under `node_modules/<name>` in the cache. Exactly one of
+ * `urlTemplate` / `npmPackages` must be set.
  */
 export interface IAgentSdkProductConfig {
 	readonly version: string;
-	readonly urlTemplate: string;
+	readonly urlTemplate?: string;
+	readonly npmPackages?: readonly string[];
+	/** FORK: registry base for `npmPackages` mode. Defaults to `https://registry.npmjs.org`. */
+	readonly npmRegistry?: string;
 }
 
 export interface IProductConfiguration {

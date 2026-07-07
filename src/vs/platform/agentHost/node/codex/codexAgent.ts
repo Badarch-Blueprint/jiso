@@ -645,6 +645,17 @@ export class CodexAgent extends Disposable implements IAgent {
 		return token;
 	}
 
+	async pingAgent(): Promise<boolean> {
+		try {
+			const token = this._ensureAuthenticated();
+			await this._refreshModels(token);
+			return this._models.get().length > 0;
+		} catch (err) {
+			this._logService.warn(`[Codex] pingAgent failed: ${err instanceof Error ? err.message : String(err)}`);
+			return false;
+		}
+	}
+
 	private _defaultModel(): ModelSelection | undefined {
 		const models = this._models.get();
 		const chosen = models[0];

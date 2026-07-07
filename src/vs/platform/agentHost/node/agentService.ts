@@ -133,8 +133,8 @@ export class AgentService extends Disposable implements IAgentService {
 	 * rather than one stream per session.
 	 */
 	private readonly _downloadProgressInterest = new Map<AgentProvider, Set<string>>();
-	/** Subscriptions to provider progress events; cleared when providers change. */
-	private readonly _providerSubscriptions = this._register(new DisposableStore());
+	/** Per-provider subscriptions to progress events; disposed when the provider is unregistered. */
+	private readonly _providerSubscriptions = this._register(new DisposableMap<AgentProvider, DisposableStore>());
 	private readonly _authService: AgentHostAuthenticationService;
 	/** Default provider used when no explicit provider is specified. */
 	private _defaultProvider: AgentProvider | undefined;
@@ -370,13 +370,15 @@ export class AgentService extends Disposable implements IAgentService {
 		this._logService.info(`Registering agent provider: ${provider.id}`);
 		this._providers.set(provider.id, provider);
 		provider.setServerToolHost?.(this._serverToolHost);
-		this._providerSubscriptions.add(this._sideEffects.registerProgressListener(provider));
+		const subscriptions = new DisposableStore();
+		subscriptions.add(this._sideEffects.registerProgressListener(provider));
 		if (provider.onDidMaterializeSession) {
-			this._providerSubscriptions.add(provider.onDidMaterializeSession(e => this._onDidMaterializeSession(e)));
+			subscriptions.add(provider.onDidMaterializeSession(e => this._onDidMaterializeSession(e)));
 		}
 		if (provider.onMcpNotification) {
-			this._providerSubscriptions.add(provider.onMcpNotification(e => this._onMcpNotification.fire(e)));
+			subscriptions.add(provider.onMcpNotification(e => this._onMcpNotification.fire(e)));
 		}
+		this._providerSubscriptions.set(provider.id, subscriptions);
 		this._registerSkillCompletionProvider();
 		if (!this._defaultProvider) {
 			this._defaultProvider = provider.id;
@@ -384,6 +386,30 @@ export class AgentService extends Disposable implements IAgentService {
 
 		// Update root state with current agents list
 		this._updateAgents();
+	}
+
+	/**
+	 * FORK: live deregistration for the opt-in CLI providers, so the settings
+	 * panel can toggle them off without an agent host restart. Shuts the
+	 * provider's sessions down and drops it from root state; in-flight turns
+	 * are aborted by the provider's own shutdown.
+	 */
+	unregisterProvider(id: AgentProvider): void {
+		const provider = this._providers.get(id);
+		if (!provider) {
+			return;
+		}
+		this._logService.info(`Unregistering agent provider: ${id}`);
+		this._providers.delete(id);
+		this._providerSubscriptions.deleteAndDispose(id);
+		if (this._defaultProvider === id) {
+			this._defaultProvider = this._providers.keys().next().value;
+		}
+		this._updateAgents();
+		Promise.resolve(provider.shutdown()).then(
+			() => (provider as Partial<IDisposable>).dispose?.(),
+			err => this._logService.warn(`Provider ${id} shutdown failed during unregister: ${err}`),
+		);
 	}
 
 	private _registerSkillCompletionProvider(): void {
@@ -432,8 +458,12 @@ export class AgentService extends Disposable implements IAgentService {
 		return undefined;
 	}
 
-	// FORK: route to the first provider that can run the 5-hour-window ping (native Claude only).
-	async pingAgent(): Promise<boolean> {
+	// FORK: route to a specific provider when requested, otherwise the first provider that supports ping.
+	async pingAgent(providerId?: AgentProvider): Promise<boolean> {
+		if (providerId) {
+			const provider = this._providers.get(providerId);
+			return provider?.pingAgent ? provider.pingAgent() : false;
+		}
 		for (const provider of this._providers.values()) {
 			if (provider.pingAgent) {
 				if (await provider.pingAgent()) {

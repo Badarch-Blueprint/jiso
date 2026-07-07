@@ -39,6 +39,17 @@ export interface IModelConfigurationAccess {
 	readonly onDidChange?: Event<string /* modelId */>;
 }
 
+/**
+ * FORK: models owned by another local agent-host session type, grouped per
+ * agent so the model picker can render one section per agent (e.g. "Cursor
+ * Agent", "Antigravity" while chatting with Claude).
+ */
+export interface ICrossAgentModelGroup {
+	readonly sessionType: string;
+	readonly displayName: string;
+	readonly models: ILanguageModelChatMetadataAndIdentifier[];
+}
+
 export interface IModelPickerDelegate {
 	readonly currentModel: IObservable<ILanguageModelChatMetadataAndIdentifier | undefined>;
 	setModel(model: ILanguageModelChatMetadataAndIdentifier): void;
@@ -82,6 +93,20 @@ export interface IModelPickerDelegate {
 	 * sign-in for them. Omitted => applies (stock behavior).
 	 */
 	copilotSetupApplies?(): boolean;
+	/**
+	 * FORK: models offered by OTHER local agent-host session types. They cannot
+	 * run in the current session — a session is bound to one backend agent — so
+	 * picking one hands the conversation over to a new session of the owning
+	 * agent (see {@link selectCrossAgentModel}). Omitted => no cross-agent
+	 * sections in the picker.
+	 */
+	getCrossAgentModelGroups?(): ICrossAgentModelGroup[];
+	/**
+	 * FORK: invoked when the user picks a model from
+	 * {@link getCrossAgentModelGroups}. Switches the chat to a new session of
+	 * the agent that owns the model, with the model preselected.
+	 */
+	selectCrossAgentModel?(model: ILanguageModelChatMetadataAndIdentifier): void;
 }
 
 /**

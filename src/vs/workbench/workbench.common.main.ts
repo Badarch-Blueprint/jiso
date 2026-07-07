@@ -384,7 +384,7 @@ import './contrib/themes/browser/themes.contribution.js';
 // Update
 import './contrib/update/browser/update.contribution.js';
 
-// Claude Settings (FORK)
+// Jiso Settings (FORK)
 import './contrib/claudeSettings/browser/claudeSettings.contribution.js';
 
 // Surveys

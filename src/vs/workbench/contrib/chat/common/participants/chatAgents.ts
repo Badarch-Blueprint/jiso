@@ -409,11 +409,20 @@ export class ChatAgentService extends Disposable implements IChatAgentService {
 		data.isDynamic = true;
 		const agent = { data, impl: agentImpl };
 		this._agents.set(data.id, agent);
+
+		if (data.isDefault) {
+			this._hasDefaultAgent.set(true);
+		}
+
 		this._onDidChangeAgents.fire(new MergedChatAgent(data, agentImpl));
 
 		return toDisposable(() => {
 			this._agents.delete(data.id);
 			this._onDidChangeAgents.fire(undefined);
+
+			if (data.isDefault) {
+				this._hasDefaultAgent.set(Iterable.some(this._agents.values(), agent => agent.data.isDefault && !!agent.impl));
+			}
 		});
 	}
 

@@ -19,7 +19,7 @@ import type { IFileService } from '../../../files/common/files.js';
 import { DiskFileSystemProvider } from '../../../files/node/diskFileSystemProvider.js';
 import { NullLogService } from '../../../log/common/log.js';
 import { RequestService } from '../../../request/node/requestService.js';
-import { AgentSdkDownloader, resolveSdkTarget, type IAgentSdkPackage, type IAgentSdkDownloadProgress } from '../../node/agentSdkDownloader.js';
+import { AgentSdkDownloader, npmTarballUrl, resolveSdkTarget, type IAgentSdkPackage, type IAgentSdkDownloadProgress } from '../../node/agentSdkDownloader.js';
 import { ClaudeSdkPackage } from '../../node/claude/claudeAgentSdkService.js';
 import { AgentHostClaudeSdkRootEnvVar } from '../../common/agentService.js';
 import type { INativeEnvironmentService } from '../../../environment/common/environment.js';
@@ -49,24 +49,52 @@ async function buildFixtureTarball(): Promise<ITestSdkDownloadFixture> {
 	};
 }
 
+/**
+ * FORK: builds a tarball shaped like an npm registry tarball — a single
+ * `package/` top-level dir carrying the given file — for the `npmPackages`
+ * download mode, which strips that prefix and re-homes the payload under
+ * `node_modules/<name>`.
+ */
+async function buildNpmStyleTarball(innerRel: string, innerContents: string): Promise<ITestSdkDownloadFixture> {
+	const tar = await import('tar');
+	const stagingDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'sdk-npm-fixture-'));
+	await fsp.mkdir(path.dirname(path.join(stagingDir, 'package', innerRel)), { recursive: true });
+	await fsp.writeFile(path.join(stagingDir, 'package', innerRel), innerContents);
+	const tarballPath = path.join(stagingDir, 'fixture.tgz');
+	await tar.c({ file: tarballPath, cwd: stagingDir, gzip: true }, ['package']);
+	return {
+		tarballPath,
+		innerFile: innerRel,
+		innerContents,
+		cleanup: async () => fsp.rm(stagingDir, { recursive: true, force: true }),
+	};
+}
+
 interface ITestServer {
 	port: number;
 	requestCount: number;
 	lastPath: string | undefined;
+	paths: readonly string[];
 	close: () => Promise<void>;
 }
 
-async function startServer(body: Buffer): Promise<ITestServer> {
+async function startServer(body: Buffer | ((url: string) => Buffer | undefined)): Promise<ITestServer> {
 	const http: typeof httpType = await import('http');
 	return new Promise(resolve => {
-		const state = { count: 0, lastPath: undefined as string | undefined };
+		const state = { count: 0, paths: [] as string[] };
 		const server = http.createServer((req, res) => {
 			state.count++;
-			state.lastPath = req.url;
+			state.paths.push(req.url ?? '');
+			const responseBody = typeof body === 'function' ? body(req.url ?? '') : body;
+			if (!responseBody) {
+				res.statusCode = 404;
+				res.end('not found');
+				return;
+			}
 			res.statusCode = 200;
 			res.setHeader('content-type', 'application/octet-stream');
-			res.setHeader('content-length', String(body.length));
-			res.end(body);
+			res.setHeader('content-length', String(responseBody.length));
+			res.end(responseBody);
 		});
 		server.listen(0, '127.0.0.1', () => {
 			const addr = server.address();
@@ -74,7 +102,8 @@ async function startServer(body: Buffer): Promise<ITestServer> {
 			resolve({
 				get port() { return port; },
 				get requestCount() { return state.count; },
-				get lastPath() { return state.lastPath; },
+				get lastPath() { return state.paths[state.paths.length - 1]; },
+				get paths() { return state.paths; },
 				close: () => new Promise(res => server.close(() => res())),
 			});
 		});
@@ -89,7 +118,7 @@ function makeEnvService(userDataPath: string): INativeEnvironmentService {
 	return { userDataPath, args: { 'force-disable-user-env': true } as never } as unknown as INativeEnvironmentService;
 }
 
-function makeProductService(config: { version: string; urlTemplate: string } | undefined): IProductService {
+function makeProductService(config: { version: string; urlTemplate?: string; npmPackages?: readonly string[]; npmRegistry?: string } | undefined): IProductService {
 	return {
 		agentSdks: config ? { claude: config } : undefined,
 	} as unknown as IProductService;
@@ -174,6 +203,26 @@ suite('resolveSdkTarget', () => {
 	});
 });
 
+// FORK: npm-registry tarball URL construction for `npmPackages` mode.
+suite('npmTarballUrl', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('builds registry tarball URLs for scoped and unscoped names', () => {
+		assert.deepStrictEqual({
+			scoped: npmTarballUrl('@anthropic-ai/claude-agent-sdk', '0.3.187'),
+			scopedPlatform: npmTarballUrl('@anthropic-ai/claude-agent-sdk-darwin-arm64', '0.3.187'),
+			unscoped: npmTarballUrl('left-pad', '1.3.0'),
+			customRegistry: npmTarballUrl('@scope/pkg', '1.0.0', 'http://127.0.0.1:9999/'),
+		}, {
+			scoped: 'https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.187.tgz',
+			scopedPlatform: 'https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-darwin-arm64/-/claude-agent-sdk-darwin-arm64-0.3.187.tgz',
+			unscoped: 'https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz',
+			customRegistry: 'http://127.0.0.1:9999/@scope/pkg/-/pkg-1.0.0.tgz',
+		});
+	});
+});
+
 /**
  * Integration tests for the downloader's network → cache → extract flow.
  * These run against whatever `process.platform` the test host is — the
@@ -232,12 +281,15 @@ suite('AgentSdkDownloader', () => {
 	 * Default urlTemplate references `{sdkTarget}` so we exercise the
 	 * substitution path; tests that need a custom URL pass urlTemplate
 	 * explicitly. Pass `productConfig: null` to omit the agentSdks block
-	 * entirely (the "no product config" case).
+	 * entirely (the "no product config" case). FORK: passing `npmPackages`
+	 * (without `urlTemplate`) exercises the npm-registry mode.
 	 */
-	function makeDownloader(productConfig?: { version?: string; urlTemplate?: string } | null) {
+	function makeDownloader(productConfig?: { version?: string; urlTemplate?: string; npmPackages?: readonly string[]; npmRegistry?: string } | null) {
 		const config = productConfig === null ? undefined : {
 			version: productConfig?.version ?? '1.0.0',
-			urlTemplate: productConfig?.urlTemplate ?? `http://127.0.0.1:${server.port}/sdk-{sdkTarget}.tgz`,
+			...(productConfig?.npmPackages
+				? { npmPackages: productConfig.npmPackages, npmRegistry: productConfig.npmRegistry, ...(productConfig.urlTemplate ? { urlTemplate: productConfig.urlTemplate } : {}) }
+				: { urlTemplate: productConfig?.urlTemplate ?? `http://127.0.0.1:${server.port}/sdk-{sdkTarget}.tgz` }),
 		};
 		return disposables.add(new AgentSdkDownloader(
 			makeEnvService(userDataPath),
@@ -399,6 +451,52 @@ suite('AgentSdkDownloader', () => {
 		assert.strictEqual(a, b);
 		assert.strictEqual(b, c);
 		assert.strictEqual(server.requestCount, 1, 'concurrent loaders must dedupe');
+	});
+
+	// FORK: npm-registry mode — multiple package tarballs re-homed under
+	// node_modules/<name>, straight from the (test-loopback) registry.
+	test('loadSdkRoot: npm mode fetches each package and lays them out under node_modules', async () => {
+		const mainPkg = await buildNpmStyleTarball('sdk.mjs', '// main sdk\n');
+		const platformPkg = await buildNpmStyleTarball('claude', '#!binary\n');
+		try {
+			await server.close();
+			server = await startServer(url =>
+				url === `/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-1.0.0.tgz` ? fs.readFileSync(mainPkg.tarballPath)
+					: url === `/@anthropic-ai/claude-agent-sdk-${hostSdkTarget}/-/claude-agent-sdk-${hostSdkTarget}-1.0.0.tgz` ? fs.readFileSync(platformPkg.tarballPath)
+						: undefined);
+			const downloader = makeDownloader({
+				npmPackages: ['@anthropic-ai/claude-agent-sdk', '@anthropic-ai/claude-agent-sdk-{sdkTarget}'],
+				npmRegistry: `http://127.0.0.1:${server.port}`,
+			});
+			const root = await downloader.loadSdkRoot(ClaudeSdkPackage, newToken());
+			assert.deepStrictEqual({
+				requestCount: server.requestCount,
+				mainContents: await fsp.readFile(path.join(root, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'sdk.mjs'), 'utf8'),
+				platformContents: await fsp.readFile(path.join(root, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${hostSdkTarget}`, 'claude'), 'utf8'),
+				sentinel: fs.existsSync(path.join(root, '.complete')),
+			}, {
+				requestCount: 2,
+				mainContents: '// main sdk\n',
+				platformContents: '#!binary\n',
+				sentinel: true,
+			});
+		} finally {
+			await mainPkg.cleanup();
+			await platformPkg.cleanup();
+		}
+	});
+
+	// FORK: exactly one of urlTemplate / npmPackages must be configured.
+	test('loadSdkRoot: config with both urlTemplate and npmPackages throws config error', async () => {
+		const downloader = makeDownloader({
+			urlTemplate: `http://127.0.0.1:${server.port}/sdk-{sdkTarget}.tgz`,
+			npmPackages: ['@anthropic-ai/claude-agent-sdk'],
+		});
+		await assert.rejects(
+			() => downloader.loadSdkRoot(ClaudeSdkPackage, newToken()),
+			/must set exactly one of `urlTemplate` or `npmPackages`/,
+		);
+		assert.strictEqual(server.requestCount, 0, 'should fail before any HTTP call');
 	});
 
 	test('loadSdkRoot: rename-loser path returns existing cache when winner already published', async () => {

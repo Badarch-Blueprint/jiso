@@ -1249,8 +1249,8 @@ export class ProtocolServerHandler extends Disposable {
 		getSessionLogs: async (_client, params) => {
 			return this._agentService.getSessionLogs(URI.parse(params.channel));
 		},
-		pingAgent: async (_client, _params) => {
-			return this._agentService.pingAgent();
+		pingAgent: async (_client, params) => {
+			return this._agentService.pingAgent(params.provider);
 		},
 		fetchTurns: async (_client, params) => {
 			const state = this._stateManager.getSessionState(params.channel);

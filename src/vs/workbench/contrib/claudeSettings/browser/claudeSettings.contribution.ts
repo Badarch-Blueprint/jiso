@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 /*---------------------------------------------------------------------------------------------
- *  FORK: registers the "Claude Settings" service + the title-bar gear button
+ *  FORK: registers the "Jiso Settings" service + the title-bar gear button
  *  that opens it. The panel edits JisoIDE's own agent-host root config
  *  (context management: trimming, auto-compact) — see ./claudeSettingsPanel.
  *--------------------------------------------------------------------------------------------*/
@@ -24,8 +24,8 @@ registerAction2(class OpenClaudeSettingsAction extends Action2 {
 	constructor() {
 		super({
 			id: OPEN_CLAUDE_SETTINGS_ID,
-			title: localize2('openClaudeSettings', "Claude Settings"),
-			category: localize2('claude', "Claude"),
+			title: localize2('openClaudeSettings', "Jiso Settings"),
+			category: localize2('jiso', "Jiso"),
 			icon: Codicon.settingsGear,
 			f1: true,
 			menu: [{

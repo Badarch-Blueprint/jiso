@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { DeferredPromise } from '../../../base/common/async.js';
+import { DeferredPromise, timeout } from '../../../base/common/async.js';
 import { Emitter, Relay } from '../../../base/common/event.js';
 import { Disposable, DisposableStore, IReference } from '../../../base/common/lifecycle.js';
 import { IObservable, ISettableObservable, observableValue } from '../../../base/common/observable.js';
@@ -16,7 +16,7 @@ import { IInstantiationService } from '../../instantiation/common/instantiation.
 import { IConfigurationService } from '../../configuration/common/configuration.js';
 import { IEnvironmentService } from '../../environment/common/environment.js';
 import { ILogService } from '../../log/common/log.js';
-import { AgentHostAhpJsonlLoggingSettingId, AgentHostCodexAgentEnabledSettingId, AgentHostIpcChannels, IAgentCreateChatOptions, IAgentCreateSessionConfig, IAgentHostInspectInfo, IAgentHostService, IAgentResolveSessionConfigParams, IAgentService, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult, IAgentHostSocketInfo, IConnectionTrackerService, isAgentHostEnabled, IMcpNotification, AgentHostOTelPolicyIpcChannel, readAgentHostOTelPolicySettings } from '../common/agentService.js';
+import { AgentHostAhpJsonlLoggingSettingId, AgentHostAntigravityAgentEnabledSettingId, AgentHostCodexAgentEnabledSettingId, AgentHostCodexFuguAgentEnabledSettingId, AgentHostCursorAgentEnabledSettingId, AgentHostIpcChannels, IAgentCreateChatOptions, IAgentCreateSessionConfig, IAgentHostInspectInfo, IAgentHostService, IAgentResolveSessionConfigParams, IAgentService, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult, IAgentHostSocketInfo, IConnectionTrackerService, isAgentHostEnabled, IMcpNotification, AgentHostOTelPolicyIpcChannel, readAgentHostOTelPolicySettings } from '../common/agentService.js';
 import { AhpJsonlLogger } from '../common/ahpJsonlLogger.js';
 import { wrapAgentServiceWithAhpLogging } from './localAhpJsonlLogging.js';
 import { AgentSubscriptionManager, isActionEnvelopeRelevantToSubscriptionUris, type IActiveSubscriptionInfo, type IAgentSubscription } from '../common/state/agentSubscription.js';
@@ -31,7 +31,7 @@ import { URI } from '../../../base/common/uri.js';
 import { AGENT_HOST_CLIENT_RESOURCE_CHANNEL, AgentHostClientResourceChannel } from '../common/agentHostClientResourceChannel.js';
 import { TELEMETRY_CRASH_REPORTER_SETTING_ID, TELEMETRY_OLD_SETTING_ID, TELEMETRY_SETTING_ID } from '../../telemetry/common/telemetry.js';
 import { getTelemetryLevel } from '../../telemetry/common/telemetryUtils.js';
-import { AgentHostTelemetryLevelConfigKey, AgentHostCodexEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, AgentHostTerminalAutoApproveEnabledConfigKey, AgentHostGlobalAutoApproveEnabledConfigKey, AgentHostAutoReplyEnabledConfigKey, AgentHostTerminalAutoApproveRulesConfigKey, getAgentHostTerminalAutoApproveRulesConfig, SESSION_SYNC_ENABLED_SETTING_ID, TERMINAL_AUTO_APPROVE_ENABLED_SETTING_ID, GLOBAL_AUTO_APPROVE_SETTING_ID, AUTO_REPLY_SETTING_ID, TERMINAL_AUTO_APPROVE_SETTING_ID, TERMINAL_IGNORE_DEFAULT_AUTO_APPROVE_RULES_SETTING_ID, telemetryLevelToAgentHostConfigValue } from '../common/agentHostSchema.js';
+import { AgentHostAntigravityAgentEnabledConfigKey, AgentHostTelemetryLevelConfigKey, AgentHostCodexEnabledConfigKey, AgentHostCodexFuguAgentEnabledConfigKey, AgentHostCursorAgentEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, AgentHostTerminalAutoApproveEnabledConfigKey, AgentHostGlobalAutoApproveEnabledConfigKey, AgentHostAutoReplyEnabledConfigKey, AgentHostTerminalAutoApproveRulesConfigKey, getAgentHostTerminalAutoApproveRulesConfig, SESSION_SYNC_ENABLED_SETTING_ID, TERMINAL_AUTO_APPROVE_ENABLED_SETTING_ID, GLOBAL_AUTO_APPROVE_SETTING_ID, AUTO_REPLY_SETTING_ID, TERMINAL_AUTO_APPROVE_SETTING_ID, TERMINAL_IGNORE_DEFAULT_AUTO_APPROVE_RULES_SETTING_ID, telemetryLevelToAgentHostConfigValue } from '../common/agentHostSchema.js';
 
 /**
  * Renderer-side implementation of {@link IAgentHostService} that connects
@@ -143,6 +143,11 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 			if (e.affectsConfiguration(AgentHostCodexAgentEnabledSettingId)) {
 				this._updateCodexEnabled();
 			}
+			// FORK: forward the opt-in CLI provider toggles live; the host
+			// registers/unregisters the providers without a restart.
+			if (e.affectsConfiguration(AgentHostCursorAgentEnabledSettingId) || e.affectsConfiguration(AgentHostAntigravityAgentEnabledSettingId) || e.affectsConfiguration(AgentHostCodexFuguAgentEnabledSettingId)) {
+				this._updateCliAgentsEnabled();
+			}
 		}));
 
 		if (isAgentHostEnabled(this._configurationService)) {
@@ -203,12 +208,34 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 		this._logService.info('[AgentHost:renderer] Direct MessagePort connection established');
 		this._onAgentHostStart.fire();
 
-		// Subscribe to root state
-		this.subscribe(URI.parse(ROOT_STATE_URI)).then(snapshot => {
-			this._subscriptionManager.handleRootSnapshot(snapshot.state as RootState, snapshot.fromSeq);
-		}).catch(err => {
-			this._logService.error('[AgentHost:renderer] Failed to subscribe to root state', err);
-		});
+		// Subscribe to root state.
+		// FORK: retried with backoff — the agent host registers its IPC channel
+		// only once all agent providers are constructed, so an early subscribe can
+		// be rejected by the IPC layer's pending-request timeout. Without a retry
+		// the window would never learn about any agent-host agents (empty
+		// session-type picker, no models) for its entire lifetime.
+		this._subscribeToRootState();
+	}
+
+	private async _subscribeToRootState(): Promise<void> {
+		for (let attempt = 1; ; attempt++) {
+			try {
+				const snapshot = await this.subscribe(URI.parse(ROOT_STATE_URI));
+				this._subscriptionManager.handleRootSnapshot(snapshot.state as RootState, snapshot.fromSeq);
+				return;
+			} catch (err) {
+				if (attempt >= 6) {
+					this._logService.error('[AgentHost:renderer] Failed to subscribe to root state, giving up', err);
+					return;
+				}
+				const delay = 1000 * Math.pow(2, attempt - 1);
+				this._logService.warn(`[AgentHost:renderer] Root state subscribe failed (attempt ${attempt}), retrying in ${delay}ms`, err);
+				await timeout(delay);
+				if (this._store.isDisposed) {
+					return;
+				}
+			}
+		}
 	}
 
 	private _updateTelemetryLevel(): void {
@@ -259,6 +286,18 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 		}, this.clientId, 0);
 	}
 
+	/** FORK: push the live enable state of the opt-in CLI providers (register/unregister without restart). */
+	private _updateCliAgentsEnabled(): void {
+		this.dispatchAction(ROOT_STATE_URI, {
+			type: ActionType.RootConfigChanged,
+			config: {
+				[AgentHostCursorAgentEnabledConfigKey]: this._configurationService.getValue<boolean>(AgentHostCursorAgentEnabledSettingId) === true,
+				[AgentHostAntigravityAgentEnabledConfigKey]: this._configurationService.getValue<boolean>(AgentHostAntigravityAgentEnabledSettingId) === true,
+				[AgentHostCodexFuguAgentEnabledConfigKey]: this._configurationService.getValue<boolean>(AgentHostCodexFuguAgentEnabledSettingId) === true,
+			},
+		}, this.clientId, 0);
+	}
+
 	private _updateTerminalAutoApproveRules(): void {
 		this.dispatchAction(ROOT_STATE_URI, {
 			type: ActionType.RootConfigChanged,
@@ -305,8 +344,8 @@ export class LocalAgentHostServiceClient extends Disposable implements IAgentHos
 	getSessionLogs(session: URI): Promise<IClaudeSessionLogs | undefined> {
 		return this._proxy.getSessionLogs(session);
 	}
-	pingAgent(): Promise<boolean> {
-		return this._proxy.pingAgent();
+	pingAgent(provider?: string): Promise<boolean> {
+		return this._proxy.pingAgent(provider);
 	}
 	getCompletionTriggerCharacters(): Promise<readonly string[]> {
 		return this._completionTriggerCharactersOnce ??= this._proxy.getCompletionTriggerCharacters();
