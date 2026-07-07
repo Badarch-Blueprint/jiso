@@ -1,0 +1,272 @@
+# FORK: build installable desktop artifacts on tag push and attach them to a
+# GitHub Release. Mirrors the canonical OSS build sequence (`gulp core-ci` →
+# `gulp vscode-<platform>-<arch>-min-ci`) that the Azure pipelines use, but runs
+# entirely on GitHub-hosted runners with no signing/notarization. Artifacts are
+# therefore UNSIGNED (macOS Gatekeeper / Windows SmartScreen will warn on first
+# run — right-click → Open on macOS, "More info → Run anyway" on Windows).
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Allow a manual run from the Actions tab without tagging.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag/name to publish under (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write # needed to create the GitHub Release and upload assets
+
+env:
+  # On a manual run there is no tag ref, so take it from the input.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # one platform failing shouldn't abort the others
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon runner → native arm64 build
+            platform: darwin
+            arch: arm64
+            out: VSCode-darwin-arm64
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x64
+            out: VSCode-linux-x64
+          - os: windows-2022
+            platform: win32
+            arch: x64
+            out: VSCode-win32-x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Setup Python # node-gyp needs Python for native module builds
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config xvfb libgtk-3-0 libxkbfile-dev libkrb5-dev libgbm1 rpm fakeroot
+
+      # A cold `npm install` (build_from_source native modules + the Claude SDK
+      # platform binary) plus the swapfile below can exhaust the runner's root
+      # disk, which crashes the runner agent itself ("No space left on device"
+      # in the worker diag log). Drop the preinstalled toolchains we never use
+      # (~20 GB) before installing anything.
+      - name: Free disk space (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/lib/jvm /usr/local/share/boost || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      # The minified desktop bundle peaks above the 7 GB of physical RAM on
+      # standard Ubuntu runners (NODE_OPTIONS allows an 8 GB heap), and the OOM
+      # killer takes the runner agent down with it ("runner has received a
+      # shutdown signal"). Give the job swap so the peak spills to disk instead.
+      # Prefer the temp disk when it is a real separate mount; otherwise the
+      # freed root disk has room. macOS/Windows runners have enough headroom.
+      - name: Add swap (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          # Some runner images already have an active /mnt/swapfile — use our
+          # own filename and size to the disk's free space (cap 10G, 2G headroom)
+          # so this works on every image variant.
+          if mountpoint -q /mnt; then DIR=/mnt; else DIR=/; fi
+          SWAPFILE="$DIR/swapfile-ci"
+          AVAIL_G=$(( $(df -k --output=avail "$DIR" | tail -1) / 1024 / 1024 ))
+          SIZE_G=$(( AVAIL_G > 12 ? 10 : AVAIL_G - 2 ))
+          if [ "$SIZE_G" -ge 2 ]; then
+            sudo fallocate -l "${SIZE_G}G" "$SWAPFILE"
+            sudo chmod 600 "$SWAPFILE"
+            sudo mkswap "$SWAPFILE"
+            sudo swapon "$SWAPFILE"
+          else
+            echo "Not enough free space on $DIR for a swapfile (${AVAIL_G}G available)"
+          fi
+          free -h; df -h / /mnt 2>/dev/null || true
+
+      # Cache the compiled node_modules so we don't recompile every native
+      # module from source (build_from_source=true in .npmrc) on every run —
+      # a cold install builds node-pty, native-keymap, spdlog, kerberos, … with
+      # node-gyp and takes 30+ min. The key covers the salt, every .npmrc and
+      # all committed package.json/package-lock.json, so it busts on any dep or
+      # native-toolchain change. Archive format lives in node_modules_cache/.
+      - name: Restore node_modules cache
+        id: node_modules_cache
+        uses: actions/cache@v4
+        with:
+          path: .build/node_modules_cache
+          key: node_modules-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('build/.cachesalt', '**/.npmrc', '**/package.json', '**/package-lock.json') }}
+
+      - name: Extract node_modules cache (macOS / Linux)
+        if: steps.node_modules_cache.outputs.cache-hit == 'true' && matrix.platform != 'win32'
+        run: ./.github/workflows/node_modules_cache/cache.sh extract
+
+      - name: Extract node_modules cache (Windows)
+        if: steps.node_modules_cache.outputs.cache-hit == 'true' && matrix.platform == 'win32'
+        shell: pwsh
+        run: ./.github/workflows/node_modules_cache/cache.ps1 extract
+
+      - name: Install build/ dependencies
+        if: steps.node_modules_cache.outputs.cache-hit != 'true'
+        working-directory: build
+        run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install root dependencies
+        if: steps.node_modules_cache.outputs.cache-hit != 'true'
+        run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          npm_config_arch: ${{ matrix.arch }}
+          # Skip the giant Electron/Playwright binary downloads during install —
+          # they stall the postinstall on GitHub runners (install hangs silent
+          # for 40+ min). The gulp package task fetches Electron itself later.
+          # This mirrors upstream's node-modules pipeline.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+
+      # On a cache miss, pack the freshly built node_modules; the actions/cache
+      # post-job step then saves .build/node_modules_cache under the key above.
+      - name: Archive node_modules cache (macOS / Linux)
+        if: steps.node_modules_cache.outputs.cache-hit != 'true' && matrix.platform != 'win32'
+        run: ./.github/workflows/node_modules_cache/cache.sh archive
+
+      - name: Archive node_modules cache (Windows)
+        if: steps.node_modules_cache.outputs.cache-hit != 'true' && matrix.platform == 'win32'
+        shell: pwsh
+        run: ./.github/workflows/node_modules_cache/cache.ps1 archive
+
+      - name: Compile (core-ci)
+        run: npm run gulp core-ci
+        env:
+          # Built-in extensions are fetched from the GitHub API during compile;
+          # without a token the anonymous 60 req/hr limit trips a 403. See
+          # build/lib/fetch.ts.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: --max-old-space-size=8192
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+
+      - name: Package (${{ matrix.platform }}-${{ matrix.arch }})
+        run: npm run gulp vscode-${{ matrix.platform }}-${{ matrix.arch }}-min-ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          npm_config_arch: ${{ matrix.arch }}
+          NODE_OPTIONS: --max-old-space-size=8192
+          # The private Copilot agent SDK layout isn't produced in this public
+          # build; skip the shim so packaging can complete (see gulpfile.vscode).
+          VSCODE_SKIP_COPILOT_SDK_SHIM: 1
+
+      # --- Conditional code signing -------------------------------------------
+      # These steps SELF-SKIP when the corresponding secrets are absent, so the
+      # build stays green and produces an unsigned app. Add the secrets (see the
+      # workflow header / repo README) to turn signing on with no further edits.
+
+      - name: Sign & notarize (macOS)
+        if: matrix.platform == 'darwin'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERTIFICATE:-}" ] || [ -z "${MACOS_SIGN_IDENTITY:-}" ]; then
+            echo "No macOS signing secrets set — shipping UNSIGNED build."
+            exit 0
+          fi
+          APP=$(ls -d "../${{ matrix.out }}"/*.app | head -1)
+          echo "Signing $APP"
+          # Import the Developer ID cert into a throwaway keychain.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PWD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          # Hardened-runtime sign. --deep applies the app entitlements to nested
+          # Electron helpers too; refine to per-helper entitlements if notarization
+          # rejects a helper.
+          codesign --force --deep --timestamp --options runtime \
+            --entitlements build/azure-pipelines/darwin/app-entitlements.plist \
+            --sign "$MACOS_SIGN_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          # Notarize only if Apple ID credentials are present.
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            ZIP="$RUNNER_TEMP/notarize.zip"
+            ditto -c -k --keepParent "$APP" "$ZIP"
+            xcrun notarytool submit "$ZIP" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+            xcrun stapler staple "$APP"
+          else
+            echo "Signed but NOT notarized (set APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID to notarize)."
+          fi
+
+      - name: Sign (Windows)
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PWD: ${{ secrets.WINDOWS_CERTIFICATE_PWD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) { Write-Host "No Windows signing cert — shipping UNSIGNED build."; exit 0 }
+          $pfx = Join-Path $env:RUNNER_TEMP "cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found on the runner" }
+          # Sign every shipped .exe with a timestamp so signatures outlive the cert.
+          Get-ChildItem "..\${{ matrix.out }}" -Recurse -Filter *.exe | ForEach-Object {
+            & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PWD `
+              /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed for $($_.FullName)" }
+          }
+
+      # The gulp package task writes to a sibling of the repo: ../<out>.
+      # Archive it so a single asset carries the whole app.
+      - name: Archive (macOS / Linux)
+        if: matrix.platform != 'win32'
+        run: |
+          cd ..
+          tar -czf "${{ github.workspace }}/${{ matrix.out }}.tar.gz" "${{ matrix.out }}"
+
+      - name: Archive (Windows)
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "..\${{ matrix.out }}" -DestinationPath "${{ github.workspace }}\${{ matrix.out }}.zip"
+
+      - name: Publish to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create the release once; concurrent matrix jobs race, so ignore "already exists".
+          # (No --verify-tag: a manual run can create the tag at the checked-out commit.)
+          gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes 2>/dev/null || true
+          asset=$( [ "${{ matrix.platform }}" = "win32" ] && echo "${{ matrix.out }}.zip" || echo "${{ matrix.out }}.tar.gz" )
+          gh release upload "$RELEASE_TAG" "$asset" --clobber
